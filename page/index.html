@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>kiln-wall stub</title>
+<!-- Stub page for KilnWall's host. The host calls window.kiln.update(data) once per JSON line,
+     and pause() / resume() when nobody can see the wallpaper. A real page replaces this file. -->
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; cursor: none; }
+  body {
+    display: grid; place-items: center;
+    color: #e6e6e6;
+    font: 500 28px/1.2 -apple-system, system-ui, sans-serif;
+    font-variant-numeric: tabular-nums;
+  }
+  #line { transition: opacity .6s ease; }
+  #line.stale { opacity: .22; }
+  #dot {
+    position: fixed; left: 0; top: calc(50% + 44px);
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #ff6a2b; will-change: transform;
+  }
+</style>
+</head>
+<body>
+<div id="line">waiting for data</div>
+<div id="dot"></div>
+<script>
+(() => {
+  const line = document.getElementById('line');
+  const dot = document.getElementById('dot');
+  // Optional page→host acknowledgement; the host logs it. A real page need not send it.
+  const host = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.kiln;
+  const encoder = new TextEncoder();
+  let count = 0, raf = 0, staleTimer = 0;
+
+  const clock = (t) => new Date(t > 1e12 ? t : t * 1000).toLocaleTimeString([], { hour12: false });
+
+  function markStaleLater() {
+    clearTimeout(staleTimer);
+    staleTimer = setTimeout(() => line.classList.add('stale'), 3000);
+  }
+
+  function update(data) {
+    const bytes = encoder.encode(JSON.stringify(data)).length;
+    const t = data && typeof data.t === 'number' ? data.t : null;
+    line.textContent = `${t === null ? 'no t' : clock(t)} · ${bytes} B${data && data.stub ? ' · stub' : ''}`;
+    line.classList.remove('stale');
+    markStaleLater();
+    count += 1;
+    if (host) host.postMessage({ count, t, bytes });
+  }
+
+  function frame(now) {
+    const span = Math.max(1, innerWidth - 10);
+    const x = (now * 0.12) % (2 * span);
+    dot.style.transform = `translateX(${x < span ? x : 2 * span - x}px)`;
+    raf = requestAnimationFrame(frame);
+  }
+
+  function pause() { cancelAnimationFrame(raf); raf = 0; }
+  function resume() { if (!raf) raf = requestAnimationFrame(frame); }
+
+  window.kiln = { update, pause, resume };
+  markStaleLater();
+  resume();
+})();
+</script>
+</body>
+</html>
