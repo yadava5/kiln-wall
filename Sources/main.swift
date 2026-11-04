@@ -286,7 +286,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
     }
 
     // Covered = on every screen, either the window server says our window is not visible, or
-    // normal windows cover ≥97% of the screen. While any window is reported visible, this is
+    // normal windows cover ≥97% of its usable area (see coveredShares). While any window is reported visible, this is
     // re-checked every 2 s, because moving a window over the desktop does not change what the
     // window server reports when it leaves a sliver uncovered.
     private func evaluateCoverage() {
@@ -324,8 +324,13 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         coverageTimer = nil
     }
 
-    // Share of each display covered by on-screen normal-layer (layer 0) windows of other apps.
-    // Areas are summed as-is (overlaps count twice), as open-wallpaper-engine-mac does.
+    // Share of each display's USABLE area (NSScreen.visibleFrame: minus the menu bar and a
+    // visible Dock) covered by the UNION of on-screen normal-layer windows of other apps.
+    // Two fixes over summing whole-screen areas (open-wallpaper-engine-mac's way), both found
+    // on this 1512×982 display: a zoomed window stops below the 33 px menu bar, so it covered
+    // at most 96.6% and never counted; and overlapping windows counted twice, so two half
+    // windows stacked in one corner could read as "covered". The union is estimated on a
+    // 64×40 grid of sample points, which is exact to well under 1% at these sizes.
     private static func coveredShares(of displays: some Collection<CGDirectDisplayID>) -> [CGDirectDisplayID: Double] {
         let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
             as? [[String: Any]] ?? []
@@ -338,15 +343,28 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
             else { return nil }
             return CGRect(dictionaryRepresentation: bounds as CFDictionary)
         }
+        // Cocoa frames are bottom-left origin relative to the primary screen; the window list is
+        // top-left. Flip against the primary screen's height.
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
         var shares: [CGDirectDisplayID: Double] = [:]
         for display in displays {
-            let screen = CGDisplayBounds(display)  // global top-left coordinates, like the window list
-            guard screen.width > 0, screen.height > 0 else { continue }
-            let area = rects.reduce(0.0) { sum, rect in
-                let part = rect.intersection(screen)
-                return part.isNull ? sum : sum + Double(part.width * part.height)
+            guard let screen = NSScreen.screens.first(where: {
+                ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == display
+            }) else { continue }
+            let v = screen.visibleFrame
+            let usable = CGRect(x: v.minX, y: primaryHeight - v.maxY, width: v.width, height: v.height)
+            guard usable.width > 0, usable.height > 0 else { continue }
+            let here = rects.filter { $0.intersects(usable) }
+            let cols = 64, rows = 40
+            var hit = 0
+            for r in 0..<rows {
+                let y = usable.minY + (Double(r) + 0.5) * usable.height / Double(rows)
+                for c in 0..<cols {
+                    let x = usable.minX + (Double(c) + 0.5) * usable.width / Double(cols)
+                    if here.contains(where: { $0.contains(CGPoint(x: x, y: y)) }) { hit += 1 }
+                }
             }
-            shares[display] = area / Double(screen.width * screen.height)
+            shares[display] = Double(hit) / Double(cols * rows)
         }
         return shares
     }
