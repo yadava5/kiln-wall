@@ -251,14 +251,20 @@ struct PageTarget: Equatable {
 // kiln-feed sends the top-level `analytics`, `github`, `hist` and `weather`, and `claude.events`,
 // `claude.limits` and `claude.tokens`, only on lines where they changed. A page that loads after
 // such a line (launch race, live reload, design switch, WebContent restart) gets the last of each
-// replayed as one line: {"replay": true, "analytics": ..., "claude": {"events": ...}, ...}, with
-// only the blocks seen so far.
+// inside `latest` (below); before any full line has been seen, as a replay line,
+// {"replay": true, "analytics": ..., "claude": {"events": ...}, ...}, with only the blocks seen so far.
 //
 // Lines go to the page as raw text, so this is the only place the host reads one. It parses only
 // a line that names one of the keys (`"<key>":`, as kiln-feed's compact json.dumps writes it):
 // measured 2026-11-04 on 148 real lines at 100 ms (median 5.4 KB), the byte scan costs 4.5 µs a
 // line against 60 µs for JSONSerialization, and 17 of the 148 named a key (all of them for real).
 // A key named elsewhere in a line only costs a parse; the blocks are read from where they belong.
+//
+// It also keeps the last line itself (a reference, no copy or parse), so a page that loads, or
+// one that was not sent the lines of a covered spell, is given the whole latest state at once:
+// `latest`, the last line with every held block it lacks filled in, as a NORMAL line (no
+// `replay`), which the runtime renders straight away. A design reads "now" from its `t`, so the
+// figures show their real, slightly stale time until the live feed takes over.
 struct ReplayCache {
     static let topKeys = ["analytics", "github", "hist", "weather"]
     static let claudeKeys = ["events", "limits", "tokens"]
@@ -266,6 +272,7 @@ struct ReplayCache {
 
     private var top: [String: Any] = [:]
     private var claude: [String: Any] = [:]
+    private var last: String?
 
     // What a replay would carry, for the logs: "analytics, ..., claude.events, ...".
     var held: String {
@@ -274,6 +281,7 @@ struct ReplayCache {
     }
 
     mutating func note(_ line: String) {
+        last = line
         guard Self.namesAKey(line),
               let json = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]
         else { return }
@@ -290,6 +298,23 @@ struct ReplayCache {
         object["replay"] = true
         guard let data = try? JSONSerialization.data(withJSONObject: object) else { return nil }
         return String(decoding: data, as: UTF8.self)
+    }
+
+    // The latest complete state as a normal line, and its `t` (for the logs). Without a last line
+    // yet (or one that does not parse), the replay line. Parses and re-encodes one line: only on a
+    // page load or an uncover, never per line.
+    func latest() -> (line: String, t: Double?)? {
+        guard let last,
+              var object = (try? JSONSerialization.jsonObject(with: Data(last.utf8))) as? [String: Any]
+        else { return line.map { ($0, nil) } }
+        for (key, value) in top where object[key] == nil { object[key] = value }
+        if !claude.isEmpty {
+            var inner = object["claude"] as? [String: Any] ?? [:]
+            for (key, value) in claude where inner[key] == nil { inner[key] = value }
+            object["claude"] = inner
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return (last, nil) }
+        return (String(decoding: data, as: UTF8.self), (object["t"] as? NSNumber)?.doubleValue)
     }
 
     // Whether a `"` in the line opens one of `"<key>":`.

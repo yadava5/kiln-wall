@@ -4,10 +4,10 @@
 // wallpaper window, so whatever picture macOS holds flashes on screen in those transitions
 // (recorded 2026-11-05: ~0.4 s entering Mission Control, ~1 frame leaving it). So each display's
 // web view is snapshotted now and then and the snapshot set as that display's desktop picture.
-// When (main.swift decides): 8 s after a page load (which covers a design change), when the
-// wallpaper becomes paused (nobody sees it then; at most once per 120 s), on a Space change
-// (the desktop picture is per Space and setDesktopImageURL sets only the current one), and when
-// matching is switched on. Never on a timer while the wallpaper is visible.
+// When (main.swift decides, snapshotIfDue): only while the wallpaper runs, never while covered
+// or paused (such a view may hold nothing current); 8 s after a page load, when matching is
+// switched on, and otherwise (on a Space change, the desktop picture being per Space, and while
+// the page runs) at most once per 60 s and only if the page was sent a line since the last.
 //
 // Each snapshot goes to a new file in ~/Library/Application Support/KilnWall/desktop/ (macOS
 // caches the picture by URL, so a rewritten file would not be re-read), keeping the last two per
@@ -44,8 +44,10 @@ final class DesktopMatcher {
 
     // MARK: Updating
 
+    // Snapshots and writes the file whether or not matching is on (main.swift also lays the newest
+    // file over a reloading page); only `set` needs `enabled`.
     func update(_ display: CGDirectDisplayID, reason: String) {
-        guard enabled, let webView = webViewFor(display), let screen = Self.screen(display) else { return }
+        guard let webView = webViewFor(display), let screen = Self.screen(display) else { return }
         if inFlight[display] != nil {
             pending[display] = reason
             return
@@ -257,13 +259,23 @@ final class DesktopMatcher {
     // The newest `keep` of this display's files stay (names sort by time); only this folder and
     // only names this app writes are touched.
     nonisolated private static func prune(_ display: CGDirectDisplayID) {
-        let prefix = "desktop-\(display)-"
-        let names = ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
-            .filter { $0.hasPrefix(prefix) && $0.hasSuffix(".jpg") }
-            .sorted { $0.count != $1.count ? $0.count < $1.count : $0 < $1 }
-        for name in names.dropLast(keep) {
+        for name in pictures(display).dropLast(keep) {
             try? FileManager.default.removeItem(at: folder.appendingPathComponent(name))
         }
+    }
+
+    // This display's newest picture, if any: what main.swift lays over a page that reloads
+    // unplanned (its WebContent process ended), when there is nothing live to snapshot.
+    nonisolated static func newestPicture(_ display: CGDirectDisplayID) -> URL? {
+        pictures(display).last.map { folder.appendingPathComponent($0) }
+    }
+
+    // Oldest first.
+    nonisolated private static func pictures(_ display: CGDirectDisplayID) -> [String] {
+        let prefix = "desktop-\(display)-"
+        return ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
+            .filter { $0.hasPrefix(prefix) && $0.hasSuffix(".jpg") }
+            .sorted { $0.count != $1.count ? $0.count < $1.count : $0 < $1 }
     }
 
     private static func isOurs(_ url: URL) -> Bool {

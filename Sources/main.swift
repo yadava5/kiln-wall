@@ -5,7 +5,13 @@
 // ~/.config/kiln-wall/designs/<design>/index.html. Each JSON line from the feed (Feed.swift) is
 // handed to the page as its raw text, window.kiln.update(line), and the design and refresh period (100..1000 ms,
 // settings.json, see Settings.swift) as window.kiln.config({design, period_ms}). Whenever nobody
-// can see the wallpaper the feed is stopped and the page is told window.kiln.pause().
+// can see the wallpaper the page is told window.kiln.pause() and the feed is stopped, except
+// under a cover (a window or full-screen Space over the desktop): then the feed runs on for a
+// grace period at 1 s, its lines kept but not sent, so a quick return shows the latest state at
+// once (see coveredGrace).
+//
+// The page never shows blank (Ayush, 2026-11-05): a page that (re)loads is sent the latest state
+// as its first line, and a snapshot of the old page is laid over it until it has painted.
 //
 // The period and design change live, from the menu-bar item, the global hotkeys ⌃⌥= (faster,
 // −100 ms) and ⌃⌥- (slower, +100 ms), or the `kiln-wall` CLI, which writes settings.json.
@@ -43,12 +49,43 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
     // Desktop picture updates (see Desktop.swift): this long after a page load, and when paused at
     // most this often.
     private static let desktopAfterLoad: TimeInterval = 8
-    private static let desktopWhilePausedEvery: TimeInterval = 120
+    private static let snapshotEvery: TimeInterval = 60
+    private static let snapshotSettle: TimeInterval = 2
+    // An overlay picture whose luma varies less than this is a blank page: not shown.
+    private static let blankLumaStd = 3.0
+    // Covered: the feed is kept this long at coveredPeriodMs, so a return within it shows the
+    // state of a second ago at once. Measured 2026-11-05 (kiln-feed --stream --period-ms 1000,
+    // 150 s, load average 2.3-3.5): own CPU 1.17% of a core (0.87-1.43% per 30 s), 2.5% with the
+    // ps/netstat/pmset children it forks; a fresh start costs 90 ms of CPU and its first line
+    // comes one period later. So a full grace costs ~3 CPU-seconds; 120 s is Ayush's "a minute or
+    // two", and a cover that outlasts it stops the feed as before.
+    private static let coveredGrace: TimeInterval = 120
+    private static let coveredPeriodMs = 1000
+    // A reloading page's overlay (a snapshot of it before the reload) fades out over this once the
+    // page has painted its first line, and goes after overlayTimeout anyway (while it is seen).
+    private static let overlayFade: TimeInterval = 0.2
+    private static let overlayTimeout: TimeInterval = 3
+    // Until a page reports its own: glass's #0b1120 (the default design).
+    private static let defaultBackground = NSColor(srgbRed: 11 / 255, green: 17 / 255, blue: 32 / 255, alpha: 1)
 
     private var windows: [CGDirectDisplayID: NSWindow] = [:]
     private var webViews: [CGDirectDisplayID: WKWebView] = [:]
     private var reasons: Set<PauseReason> = []
-    private var running = false  // feed on and page told to animate
+    private var running = false  // page told to animate (and the feed on, its lines sent)
+    // Covered, within the grace: the feed runs at coveredPeriodMs and its lines are kept, not sent.
+    private var holding = false
+    private var graceWork: DispatchWorkItem?
+    private var graceStarted = Date()
+    private var graceCPU: Double?
+    // Lines kept since the page was last sent one: it is sent `replay.latest()` when it runs again.
+    private var heldUnsent = false
+    private var overlays: [CGDirectDisplayID: (view: NSImageView, since: Date)] = [:]
+    private var overlayTimeouts: [CGDirectDisplayID: DispatchWorkItem] = [:]
+    private var snapshotting: Set<CGDirectDisplayID> = []
+    // Test hook, only with KILNWALL_TEST_COVER=1 in the environment: SIGUSR2 flips a forced
+    // covered / uncovered that replaces what the window server and the window list say, so the
+    // cover path (grace, latest state, overlay) runs without moving anyone's windows.
+    private var forcedCover: Bool?
     private var coverageTimer: Timer?
     private var settings = Settings.load()
     private lazy var target = PageTarget.resolve(settings.design)
@@ -75,7 +112,14 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
     private var replay = ReplayCache()
     private lazy var desktop = DesktopMatcher(enabled: settings.matchDesktop) { [weak self] in self?.webViews[$0] }
     private var desktopAfterLoadWork: [CGDirectDisplayID: DispatchWorkItem] = [:]
-    private var lastPausedDesktop: Date?
+    private var snapshotDue: Set<CGDirectDisplayID> = []
+    private var sentSinceSnapshot: Set<CGDirectDisplayID> = []
+    private var lastSnapshot: [CGDirectDisplayID: Date] = [:]
+    private var runningSince = Date.distantFuture
+    private var pausedSince = Date()
+    // A page-file change, design switch or menu Reload while the wallpaper was paused: the page is
+    // reloaded when it runs again, under the last snapshot, not while nobody can see it.
+    private var reloadOnRun = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         log("started; design \(settings.design), period \(settings.periodMs) ms, match desktop \(settings.matchDesktop); designs in \(Designs.root.path)")
@@ -110,23 +154,98 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         apply()
     }
 
+    // Only "desktop covered" alone gets the grace: locked, Low Power Mode, paused by you and
+    // hidden stop the feed at once, also when one of them joins a cover already in its grace.
     private func apply() {
         let shouldRun = reasons.isEmpty
         if shouldRun != running {
             running = shouldRun
             if shouldRun {
+                let kept = holding
+                let away = Date().timeIntervalSince(pausedSince)
+                runningSince = Date()
+                endGrace()
+                feed.setPeriod(settings.periodMs)
                 feed.start()
+                if reloadOnRun {
+                    // Changed while nobody could see it: reload now, under the last snapshot.
+                    reloadOnRun = false
+                    log("page: reloading on return (changed while paused)")
+                    for (display, webView) in webViews {
+                        if overlays[display] != nil || showNewestPicture(display, why: "reload on return") {
+                            load(webView)
+                        } else {
+                            reload(display, webView)  // no picture yet: a snapshot of the page first
+                        }
+                    }
+                } else {
+                    // Past the grace, cover the return with the last snapshot until the page's first
+                    // frame after resume: in case WebKit dropped the pixels of a long-hidden page.
+                    if away >= Self.coveredGrace {
+                        for display in webViews.keys where overlays[display] == nil {
+                            showNewestPicture(display, why: String(format: "return after %.0f s", away))
+                        }
+                    }
+                    // While the page is still paused, so its figures snap to the state instead of
+                    // gliding from the old one; the feed's next line follows within one period.
+                    if heldUnsent { sendLatest(why: kept ? "uncovered within the grace" : "running again") }
+                }
                 evaluateEverywhere("window.kiln && window.kiln.resume && window.kiln.resume()")
-                log("running")
+                liftOverlaysAfterFirstFrame()
+                for display in overlays.keys where overlayTimeouts[display] == nil { armOverlayTimeout(display) }
+                log((kept ? "running (feed kept through the cover, \(feed.mode))" : "running") + String(format: " after %.1f s paused", away))
             } else {
-                feed.stop()
-                // Before pause(): the snapshot should show the page as it ran, not its paused look.
-                desktopWhilePaused()
+                pausedSince = Date()
+                runningSince = .distantFuture
+                if reasons == [.covered] { startGrace() } else { feed.stop() }
                 evaluateEverywhere("window.kiln && window.kiln.pause && window.kiln.pause()")
                 log("paused: \(stateText)")
             }
+        } else if holding, reasons != [.covered] {
+            log("feed: grace cut short (\(stateText))")
+            stopHeldFeed()
         }
         statusItem?.button?.appearsDisabled = !running
+    }
+
+    // The covered grace. The feed is told the slow period on its stdin (same pid, same state);
+    // its lines only update `replay`.
+    private func startGrace() {
+        holding = true
+        graceStarted = Date()
+        feed.setPeriod(Self.coveredPeriodMs)
+        graceCPU = feed.childPID.flatMap(Headless.cpuSeconds)
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.graceExpired() }
+        }
+        graceWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.coveredGrace, execute: work)
+        log("feed: kept \(Int(Self.coveredGrace)) s under the cover at \(Self.coveredPeriodMs) ms, lines held (\(feed.mode))")
+    }
+
+    private func graceExpired() {
+        graceWork = nil
+        guard holding else { return }
+        log("feed: grace over")
+        stopHeldFeed()
+    }
+
+    private func stopHeldFeed() {
+        let seconds = Date().timeIntervalSince(graceStarted)
+        if let before = graceCPU, let pid = feed.childPID, let after = Headless.cpuSeconds(pid) {
+            log(String(format: "feed: kiln-feed.py (pid %d) used %.0f ms CPU in %.0f s held at %d ms, %.2f%% of a core",
+                       pid, (after - before) * 1000, seconds, Self.coveredPeriodMs, (after - before) / seconds * 100))
+        }
+        endGrace()
+        feed.stop()
+        feed.setPeriod(settings.periodMs)  // no child now: what the next one starts with
+    }
+
+    private func endGrace() {
+        graceWork?.cancel()
+        graceWork = nil
+        holding = false
+        graceCPU = nil
     }
 
     private var stateText: String {
@@ -144,7 +263,8 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         settings = new
         if new.periodMs != old.periodMs {
             log("period \(old.periodMs) -> \(new.periodMs) ms (\(source))")
-            feed.setPeriod(new.periodMs)
+            // Held under a cover, the feed stays slow; uncovering restores settings.periodMs.
+            if !holding { feed.setPeriod(new.periodMs) }
         }
         // A new design reloads the page, and the load schedules the desktop picture's update.
         if new.design != old.design {
@@ -155,7 +275,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
             log("match desktop \(old.matchDesktop) -> \(new.matchDesktop) (\(source))")
             desktop.enabled = new.matchDesktop
             if new.matchDesktop {
-                updateDesktopEverywhere(reason: "matching switched on")
+                snapshotEverywhere(reason: "matching switched on", force: true)
             } else {
                 desktop.restore(reason: "matching switched off")
             }
@@ -244,15 +364,23 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         configuration.userContentController.add(messages, name: "kiln")
         let webView = WKWebView(frame: NSRect(origin: .zero, size: size), configuration: configuration)
         webView.autoresizingMask = [.width, .height]
-        // Let the black window show until the page paints, instead of WebKit's white.
+        // Let the window's background show until the page paints, instead of WebKit's white.
         webView.setValue(false, forKey: "drawsBackground")
         webView.underPageBackgroundColor = .black
         return webView
     }
 
     // A design reads the whole designs folder (its pages load ../_shared/kiln-runtime.js).
+    // WebKit's memory cache is emptied first: a loadFileURL into the same web view otherwise
+    // serves the page's scripts from it, so the new index.html ran the OLD panes.js, deck.js, ...
+    // and no design JS edit reached the wallpaper from 00:58 to 02:15 on 2026-11-05 (found by the
+    // Glass agent; reload() or this removal both load the new file).
     static func loadPage(_ webView: WKWebView, _ target: PageTarget) {
-        webView.loadFileURL(target.index, allowingReadAccessTo: target.readAccess)
+        webView.configuration.websiteDataStore.removeData(
+            ofTypes: [WKWebsiteDataTypeMemoryCache], modifiedSince: .distantPast
+        ) { [weak webView] in
+            webView?.loadFileURL(target.index, allowingReadAccessTo: target.readAccess)
+        }
     }
 
     // Data for the page: the line's raw text as a String argument (no string building), which the
@@ -320,15 +448,80 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         return [shown, shared].contains { path == $0 || path.hasPrefix($0 + "/") }
     }
 
+    // A reload this app decides on (a design file changed, a design switch, the menu's Reload): a
+    // snapshot of the page as it is goes over it first, so the reload never shows blank.
     private func reloadPages() {
-        for webView in webViews.values { load(webView) }
+        guard running else {
+            if !reloadOnRun { log("page: reload deferred until the wallpaper runs (\(stateText))") }
+            reloadOnRun = true
+            return
+        }
+        for (display, webView) in webViews { reload(display, webView) }
+    }
+
+    private func reload(_ display: CGDirectDisplayID, _ webView: WKWebView) {
+        // Still covering a load that has not painted: that picture is the right one, not a new
+        // snapshot of a half-loaded page.
+        if overlays[display] != nil {
+            armOverlayTimeout(display)
+            return load(webView)
+        }
+        // Only a page on screen is snapshotted; otherwise the newest snapshot of one.
+        guard windows[display]?.occlusionState.contains(.visible) == true else {
+            showNewestPicture(display, why: "reload")
+            return load(webView)
+        }
+        // A snapshot already under way loads the page (the current target) when it completes.
+        guard snapshotting.insert(display).inserted else { return }
+        let started = DispatchTime.now().uptimeNanoseconds
+        let configuration = WKSnapshotConfiguration()
+        configuration.afterScreenUpdates = false  // what is on screen now, also while paused
+        webView.takeSnapshot(with: configuration) { [weak self] image, error in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.snapshotting.remove(display)
+                guard self.webViews[display] === webView else { return }
+                let ms = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e6
+                if let image, self.showOverlay(display, image, from: String(format: "a snapshot of the running page (%.0f ms)", ms)) {
+                } else {
+                    if image == nil { log("overlay: display \(display) snapshot failed: \(error?.localizedDescription ?? "no image")") }
+                    self.showNewestPicture(display, why: "reload")
+                }
+                self.load(webView)
+            }
+        }
     }
 
     private func push(_ line: String) {
         replay.note(line)
-        for webView in webViews.values {
-            Self.send(line, to: webView) { [weak self] error in self?.scriptFailed(error) }
+        if holding {
+            heldUnsent = true
+            return
         }
+        heldUnsent = false
+        for (display, webView) in webViews {
+            Self.send(line, to: webView) { [weak self] error in self?.scriptFailed(error) }
+            if running {
+                sentSinceSnapshot.insert(display)
+                snapshotIfDue(display, reason: "running")
+            }
+        }
+    }
+
+    // The latest state (the last line with every held block) as one normal line: the page renders
+    // it at once, at the time it carries.
+    private func sendLatest(why: String) {
+        heldUnsent = false
+        guard let latest = replay.latest() else { return }
+        for webView in webViews.values {
+            Self.send(latest.line, to: webView) { [weak self] error in self?.scriptFailed(error) }
+        }
+        log("page: sent the latest state (\(why)), \(Self.age(latest.t)), \(latest.line.utf8.count) bytes")
+    }
+
+    private static func age(_ t: Double?) -> String {
+        guard let t else { return "blocks only (no full line yet)" }
+        return String(format: "%.1f s old", Date().timeIntervalSince1970 - t)
     }
 
     private func evaluateEverywhere(_ body: String) {
@@ -350,8 +543,14 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
     // window.webkit.messageHandlers.kiln.postMessage(...) from the page: logged as proof of delivery.
     fileprivate func pageSaid(_ message: WKScriptMessage) {
         acknowledged += 1
-        guard acknowledged == 1 || acknowledged % 10 == 0 else { return }
         let display = webViews.first { $0.value === message.webView }?.key ?? 0
+        // kiln-runtime.js: the first line is on screen (two frames after it), once per load.
+        if let body = message.body as? [String: Any], (body["painted"] as? Bool) == true {
+            log("page painted on display \(display)")
+            fadeOverlay(display, why: "page painted")
+            return
+        }
+        guard acknowledged == 1 || acknowledged % 10 == 0 else { return }
         let body = (try? JSONSerialization.data(withJSONObject: message.body))
             .map { String(decoding: $0, as: UTF8.self) } ?? "\(message.body)"
         log("page ack #\(acknowledged) on display \(display): \(body)")
@@ -362,49 +561,200 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         log("page loaded on display \(display) (WebContent pid \(Self.webProcessID(webView)))")
         scriptErrors = 0
         configure(webView)
-        // A partial update: the page merges it with the next full line.
-        if let line = replay.line {
-            log("page: replayed \(replay.held)")
-            Self.send(line, to: webView) { [weak self] error in self?.scriptFailed(error) }
-        }
         if !running {
             webView.callAsyncJavaScript(
                 "window.kiln && window.kiln.pause && window.kiln.pause()", arguments: [:], in: nil, in: .page)
         }
+        // The whole latest state as the page's first line, so it draws at once (and posts
+        // {painted: true}) instead of waiting for the feed's next line, or for an uncover.
+        if let latest = replay.latest() {
+            log("page: sent the latest state on load, \(Self.age(latest.t)), with \(replay.held)")
+            Self.send(latest.line, to: webView) { [weak self] error in self?.scriptFailed(error) }
+        }
+        readBackground(display, webView)
         scheduleDesktopAfterLoad(display)
     }
 
-    // MARK: Desktop picture (Desktop.swift)
+    // The window shows its background wherever the page has not drawn (before its first paint,
+    // during a WebContent restart): the page's own colour, not black.
+    private func readBackground(_ display: CGDirectDisplayID, _ webView: WKWebView) {
+        let script = """
+            const css = (e) => e ? getComputedStyle(e).backgroundColor : "";
+            return [css(document.body), css(document.documentElement)];
+            """
+        webView.callAsyncJavaScript(script, arguments: [:], in: nil, in: .page) { [weak self] result in
+            guard let self, case .success(let value) = result, let colours = value as? [String] else { return }
+            guard let colour = colours.lazy.compactMap(Self.opaqueColour).first,
+                  let window = self.windows[display], window.backgroundColor != colour else { return }
+            window.backgroundColor = colour
+            log("window background on display \(display): \(colours.first { Self.opaqueColour($0) != nil } ?? "?") from the page")
+        }
+    }
 
-    // The one timed update: once the page has loaded and drawn its data.
+    // "rgb(11, 17, 32)" or "rgba(r, g, b, a)" with a > 0.
+    private static func opaqueColour(_ css: String) -> NSColor? {
+        guard let open = css.firstIndex(of: "("), let close = css.lastIndex(of: ")") else { return nil }
+        let parts = css[css.index(after: open)..<close].split(separator: ",").compactMap {
+            Double($0.trimmingCharacters(in: .whitespaces))
+        }
+        guard parts.count >= 3, parts.count == 4 ? parts[3] > 0 : true else { return nil }
+        return NSColor(srgbRed: parts[0] / 255, green: parts[1] / 255, blue: parts[2] / 255, alpha: 1)
+    }
+
+    // MARK: Overlay over a reloading or returning page
+
+    // Every picture is checked before it is shown: its luma over a 48x30 grid, logged, and refused
+    // when it is a uniform field (a blank page). A populated page has a std of ~20 (glass).
+    @discardableResult
+    private func showOverlay(_ display: CGDirectDisplayID, _ image: NSImage, from source: String) -> Bool {
+        guard let container = windows[display]?.contentView else { return false }
+        let stats = Self.lumaStats(image)
+        let described = stats.map { String(format: "luma mean %.1f std %.1f", $0.mean, $0.std) } ?? "luma unknown"
+        guard let stats, stats.std >= Self.blankLumaStd else {
+            log("overlay: display \(display) refused \(source): blank (\(described))")
+            return false
+        }
+        let view = overlays[display]?.view ?? NSImageView(frame: container.bounds)
+        view.image = image
+        view.imageScaling = .scaleAxesIndependently
+        view.autoresizingMask = [.width, .height]
+        view.wantsLayer = true
+        view.alphaValue = 1
+        if view.superview == nil { container.addSubview(view, positioned: .above, relativeTo: nil) }
+        overlays[display] = (view, Date())
+        armOverlayTimeout(display)
+        log("overlay: display \(display) shows \(source), \(described), until the page paints")
+        return true
+    }
+
+    // The newest snapshot of the running page (written by DesktopMatcher, see snapshotIfDue).
+    @discardableResult
+    private func showNewestPicture(_ display: CGDirectDisplayID, why: String) -> Bool {
+        guard let url = DesktopMatcher.newestPicture(display), let image = NSImage(contentsOf: url) else {
+            log("overlay: display \(display) has no picture to show (\(why))")
+            return false
+        }
+        let age = ((try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate)
+            .map { String(format: ", %.0f s old", Date().timeIntervalSince($0)) } ?? ""
+        return showOverlay(display, image, from: "\(url.lastPathComponent)\(age) (\(why))")
+    }
+
+    // After resume(): the page's first two frames, then the overlay goes. A page held by a cover
+    // has posted {painted} long ago, so the host waits on the frames itself.
+    private func liftOverlaysAfterFirstFrame() {
+        for (display, webView) in webViews where overlays[display] != nil {
+            webView.callAsyncJavaScript(
+                "await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))",
+                arguments: [:], in: nil, in: .page
+            ) { [weak self] result in
+                guard let self, self.webViews[display] === webView, self.running else { return }
+                if case .failure(let error) = result { return self.scriptFailed(error) }
+                // A page still loading has its own {painted} to wait for.
+                if !webView.isLoading { self.fadeOverlay(display, why: "first frame after resume") }
+            }
+        }
+    }
+
+    private static func lumaStats(_ image: NSImage) -> (mean: Double, std: Double)? {
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let width = 48, height = 30
+        var pixels = [UInt8](repeating: 0, count: width * height)
+        let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(
+                data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width,
+                space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)
+            else { return false }
+            context.interpolationQuality = .medium
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard drawn else { return nil }
+        let count = Double(pixels.count)
+        let mean = pixels.reduce(0.0) { $0 + Double($1) } / count
+        let variance = pixels.reduce(0.0) { $0 + (Double($1) - mean) * (Double($1) - mean) } / count
+        return (mean, variance.squareRoot())
+    }
+
+    private func fadeOverlay(_ display: CGDirectDisplayID, why: String) {
+        overlayTimeouts.removeValue(forKey: display)?.cancel()
+        guard let entry = overlays.removeValue(forKey: display) else { return }
+        let view = entry.view
+        log(String(format: "overlay: display %u fading out (%@) after %.2f s", display, why, Date().timeIntervalSince(entry.since)))
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = Self.overlayFade
+            view.animator().alphaValue = 0
+        } completionHandler: {
+            MainActor.assumeIsolated {
+                // Not if a new reload has put it back meanwhile.
+                if self.overlays[display]?.view !== view { view.removeFromSuperview() }
+            }
+        }
+    }
+
+    // A page that never posts {painted: true} (a design without the runtime, a broken page) must
+    // not keep the picture. Only counted while the wallpaper runs: a covered page may not draw.
+    private func armOverlayTimeout(_ display: CGDirectDisplayID) {
+        overlayTimeouts[display]?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.overlayTimeouts[display] = nil
+                guard self.overlays[display] != nil else { return }
+                if self.running {
+                    self.fadeOverlay(display, why: "no paint within \(Int(Self.overlayTimeout)) s")
+                } else {
+                    log("overlay: display \(display) kept: no paint yet, the wallpaper is paused (\(Int(Self.overlayTimeout)) s more once it runs)")
+                }
+            }
+        }
+        overlayTimeouts[display] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.overlayTimeout, execute: work)
+    }
+
+    // MARK: Snapshots: the desktop picture and the overlay (Desktop.swift)
+
+    // A page is snapshotted only while the wallpaper runs (on screen and drawing): a covered or
+    // paused web view may hold nothing current, and an overlay made from one was blank and held
+    // for 639 s (2026-11-05). The newest file per display is both the macOS desktop picture (when
+    // matching is on; it is written either way) and the overlay over a page that reloads unplanned,
+    // reloads on return from a cover, or returns from a long cover.
+    // When: 8 s after a page load (once running, if it loaded under a cover), when matching is
+    // switched on, and otherwise (Space changes, the running page) at most every snapshotEvery and
+    // only if the page was sent a line since the last one. Each costs ~100-220 ms of async
+    // capture, 3-6 ms of WebContent CPU and a ~1 MB JPEG written off the main thread.
     private func scheduleDesktopAfterLoad(_ display: CGDirectDisplayID) {
         desktopAfterLoadWork[display]?.cancel()
-        guard settings.matchDesktop else { return }
         let work = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.desktopAfterLoadWork[display] = nil
-                if !self.reasons.contains(.hidden) { self.desktop.update(display, reason: "page loaded") }
+                self.snapshotDue.insert(display)
+                self.snapshotIfDue(display, reason: "page loaded")
             }
         }
         desktopAfterLoadWork[display] = work
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.desktopAfterLoad, execute: work)
     }
 
-    // Paused: nobody sees the wallpaper, so a snapshot costs nothing visible. Not when hidden (the
-    // window is ordered out), not while a page-load update is still due, at most every 120 s.
-    private func desktopWhilePaused() {
-        guard settings.matchDesktop, !reasons.contains(.hidden) else { return }
-        if let last = lastPausedDesktop, Date().timeIntervalSince(last) < Self.desktopWhilePausedEvery { return }
-        let due = webViews.keys.filter { desktopAfterLoadWork[$0] == nil }
-        guard !due.isEmpty else { return }
-        lastPausedDesktop = Date()
-        for display in due { desktop.update(display, reason: stateText) }
+    private func snapshotIfDue(_ display: CGDirectDisplayID, reason: String, force: Bool = false) {
+        // Running (so shown and uncovered) for a moment: the page has painted since it resumed.
+        guard running, Date().timeIntervalSince(runningSince) >= Self.snapshotSettle,
+              windows[display]?.occlusionState.contains(.visible) == true else { return }
+        let now = Date()
+        let due = snapshotDue.contains(display)
+        if !force, !due {
+            guard sentSinceSnapshot.contains(display),
+                  now.timeIntervalSince(lastSnapshot[display] ?? .distantPast) >= Self.snapshotEvery
+            else { return }
+        }
+        snapshotDue.remove(display)
+        sentSinceSnapshot.remove(display)
+        lastSnapshot[display] = now
+        desktop.update(display, reason: due && !force ? "page loaded" : reason)
     }
 
-    private func updateDesktopEverywhere(reason: String) {
-        guard settings.matchDesktop, !reasons.contains(.hidden) else { return }
-        for display in webViews.keys { desktop.update(display, reason: reason) }
+    private func snapshotEverywhere(reason: String, force: Bool = false) {
+        for display in webViews.keys { snapshotIfDue(display, reason: reason, force: force) }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -415,8 +765,13 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         log("page failed: \(error.localizedDescription)")
     }
 
+    // Unplanned: the page is gone, so there is nothing to snapshot; the newest desktop picture
+    // (Desktop.swift), if matching has made one, covers the reload instead.
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         log("WebContent process ended; reloading the page")
+        if let display = webViews.first(where: { $0.value === webView })?.key, overlays[display] == nil {
+            showNewestPicture(display, why: "WebContent restart")
+        }
         load(webView)
     }
 
@@ -440,6 +795,8 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
             windows[display] = nil
             webViews[display] = nil
             desktopAfterLoadWork.removeValue(forKey: display)?.cancel()
+            overlays[display] = nil
+            overlayTimeouts.removeValue(forKey: display)?.cancel()
             log("display \(display) gone: \(windows.count) window(s)")
         }
         for (display, screen) in screens {
@@ -465,19 +822,26 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         window.ignoresMouseEvents = true
         window.canHide = false
         window.isOpaque = true
-        window.backgroundColor = .black
+        window.backgroundColor = Self.defaultBackground
         window.hasShadow = false
         window.isReleasedWhenClosed = false
         window.animationBehavior = .none
 
         let webView = Self.makeWebView(size: screen.frame.size, messages: MessageProxy(self))
         webView.navigationDelegate = self
-        window.contentView = webView
+        // A plain container, so a reload's overlay (an NSImageView) can sit above the web view.
+        let container = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        container.autoresizingMask = [.width, .height]
+        webView.frame = container.bounds
+        container.addSubview(webView)
+        window.contentView = container
         window.setFrame(screen.frame, display: false)
         if !reasons.contains(.hidden) { window.orderFront(nil) }
 
         windows[display] = window
         webViews[display] = webView
+        // At launch the page has no data until the feed's first line: the last snapshot covers it.
+        showNewestPicture(display, why: "launch")
         load(webView)
         NotificationCenter.default.addObserver(
             self, selector: #selector(occlusionChanged),
@@ -514,7 +878,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         let reported = windows.mapValues { $0.occlusionState.contains(.visible) }
         let anyReported = reported.values.contains(true)
         let shares = anyReported ? Self.coveredShares(of: windows.keys) : [:]
-        let covered = windows.keys.allSatisfy { !reported[$0]! || (shares[$0] ?? 0) >= Self.coveredShare }
+        let covered = forcedCover ?? windows.keys.allSatisfy { !reported[$0]! || (shares[$0] ?? 0) >= Self.coveredShare }
         if anyReported { startCoveragePoll() } else { stopCoveragePoll() }
         if covered != reasons.contains(.covered) {
             let detail = windows.keys.sorted().map { display in
@@ -609,10 +973,18 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.updateDesktopEverywhere(reason: "Space changed") }
+            MainActor.assumeIsolated { self?.snapshotEverywhere(reason: "Space changed") }
         }
         // `pkill -USR1 KilnWall` toggles show/hide; TERM and INT quit cleanly so the feed child dies too.
         onSignal(SIGUSR1) { $0.toggleShown() }
+        if ProcessInfo.processInfo.environment["KILNWALL_TEST_COVER"] == "1" {
+            log("test: KILNWALL_TEST_COVER=1, SIGUSR2 forces desktop covered / uncovered")
+            onSignal(SIGUSR2) { app in
+                app.forcedCover = !(app.forcedCover ?? false)
+                log("test: forced \(app.forcedCover! ? "covered" : "uncovered")")
+                app.evaluateCoverage()
+            }
+        }
         onSignal(SIGTERM) { _ in NSApp.terminate(nil) }
         onSignal(SIGINT) { _ in NSApp.terminate(nil) }
     }

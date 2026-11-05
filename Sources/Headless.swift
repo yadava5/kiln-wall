@@ -256,12 +256,12 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
         KilnWall.configure(webView, ["design": target.design ?? settings.design, "period_ms": periodMs]) { [weak self] error in
             self?.say("page config error: \(error.localizedDescription)")
         }
-        // The page navigated itself (a reload): as on the wallpaper, it gets the last on-change
-        // blocks replayed, and the run (data, snapshot clock) carries on.
+        // The page navigated itself (a reload): as on the wallpaper, it gets the latest state (the
+        // last line with the held on-change blocks), and the run (data, snapshot clock) carries on.
         if loadedAt != nil {
-            if let line = replay.line {
-                say("page reloaded; replayed \(replay.held)")
-                push(line)
+            if let latest = replay.latest() {
+                say("page reloaded; sent the latest state (\(replay.held))")
+                push(latest.line)
             } else {
                 say("page reloaded; nothing to replay yet")
             }
@@ -273,6 +273,17 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
         // only when it changes), so it must not reach a page that has not defined window.kiln yet.
         startData()
         if let seconds = options.measure { measure(seconds) } else { scheduleFrame(0) }
+        // Test hook: reload the page as the wallpaper does on a design-file change (loadPage into
+        // the same web view), to prove an edited script is what runs after it.
+        if let text = ProcessInfo.processInfo.environment["KILNWALL_TEST_RELOAD_AFTER"], let seconds = Double(text) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, let webView = self.webView else { return }
+                    self.say("test: reloading with KilnWall.loadPage")
+                    KilnWall.loadPage(webView, self.target)
+                }
+            }
+        }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -287,8 +298,12 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
         fail("the page's WebContent process ended")
     }
 
-    // The page may post to window.webkit.messageHandlers.kiln, as on the wallpaper; nothing to do.
-    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {}
+    // The page may post to window.webkit.messageHandlers.kiln, as on the wallpaper; printed only
+    // under the KILNWALL_TEST_RELOAD_AFTER test hook.
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard ProcessInfo.processInfo.environment["KILNWALL_TEST_RELOAD_AFTER"] != nil else { return }
+        say("page said \(message.body)")
+    }
 
     private var dataSource: String {
         if let fixture = options.fixture { return "fixture \(fixture) (\(fixtureLines.count) lines, looping)" }
