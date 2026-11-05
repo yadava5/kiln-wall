@@ -9,6 +9,9 @@
 //
 // The period and design change live, from the menu-bar item, the global hotkeys ⌃⌥= (faster,
 // −100 ms) and ⌃⌥- (slower, +100 ms), or the `kiln-wall` CLI, which writes settings.json.
+//
+// The macOS desktop picture is kept matched to the wallpaper (Desktop.swift), because Mission
+// Control and Space switches show the system's picture, not this window.
 import AppKit
 import Carbon.HIToolbox
 import os
@@ -37,6 +40,10 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
     private static let coveredShare = 0.97
     private static let coveragePoll: TimeInterval = 2
     private static let reloadDebounce: TimeInterval = 0.3
+    // Desktop picture updates (see Desktop.swift): this long after a page load, and when paused at
+    // most this often.
+    private static let desktopAfterLoad: TimeInterval = 8
+    private static let desktopWhilePausedEvery: TimeInterval = 120
 
     private var windows: [CGDirectDisplayID: NSWindow] = [:]
     private var webViews: [CGDirectDisplayID: WKWebView] = [:]
@@ -61,14 +68,20 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
     private var designMenuItem: NSMenuItem?
     private var refreshMenu: NSMenu?
     private var refreshMenuItem: NSMenuItem?
+    private var matchItem: NSMenuItem?
     private let feed = Feed()
     private var acknowledged = 0
     private var scriptErrors = 0
     private var replay = ReplayCache()
+    private lazy var desktop = DesktopMatcher(enabled: settings.matchDesktop) { [weak self] in self?.webViews[$0] }
+    private var desktopAfterLoadWork: [CGDirectDisplayID: DispatchWorkItem] = [:]
+    private var lastPausedDesktop: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        log("started; design \(settings.design), period \(settings.periodMs) ms; designs in \(Designs.root.path)")
+        log("started; design \(settings.design), period \(settings.periodMs) ms, match desktop \(settings.matchDesktop); designs in \(Designs.root.path)")
         logTarget()
+        // Matching was switched off while this was not running (or it quit without restoring).
+        if !settings.matchDesktop { desktop.restore(reason: "matching is off") }
         feed.setPeriod(settings.periodMs)
         feed.onLine = { [weak self] line in self?.push(line) }
         buildStatusItem()
@@ -83,6 +96,8 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
 
     func applicationWillTerminate(_ notification: Notification) {
         feed.stop()
+        desktop.enabled = false
+        desktop.restore(reason: "quit")
         log("quit")
     }
 
@@ -105,6 +120,8 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
                 log("running")
             } else {
                 feed.stop()
+                // Before pause(): the snapshot should show the page as it ran, not its paused look.
+                desktopWhilePaused()
                 evaluateEverywhere("window.kiln && window.kiln.pause && window.kiln.pause()")
                 log("paused: \(stateText)")
             }
@@ -129,9 +146,19 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
             log("period \(old.periodMs) -> \(new.periodMs) ms (\(source))")
             feed.setPeriod(new.periodMs)
         }
+        // A new design reloads the page, and the load schedules the desktop picture's update.
         if new.design != old.design {
             log("design \(old.design) -> \(new.design) (\(source))")
             retarget()
+        }
+        if new.matchDesktop != old.matchDesktop {
+            log("match desktop \(old.matchDesktop) -> \(new.matchDesktop) (\(source))")
+            desktop.enabled = new.matchDesktop
+            if new.matchDesktop {
+                updateDesktopEverywhere(reason: "matching switched on")
+            } else {
+                desktop.restore(reason: "matching switched off")
+            }
         }
         configureEverywhere()
     }
@@ -139,7 +166,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
     // A choice made here: apply, then record it in settings.json.
     private func choose(_ new: Settings, source: String) {
         if new == settings {
-            log("\(source): already design \(new.design), period \(new.periodMs) ms")
+            log("\(source): already design \(new.design), period \(new.periodMs) ms, match desktop \(new.matchDesktop)")
             return
         }
         applySettings(new, source: source)
@@ -159,7 +186,9 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
     }
 
     private func stepPeriod(_ delta: Int, source: String) {
-        choose(Settings(design: settings.design, periodMs: Settings.clamp(settings.periodMs + delta)), source: source)
+        var next = settings
+        next.periodMs = Settings.clamp(settings.periodMs + delta)
+        choose(next, source: source)
     }
 
     // ⌃⌥= faster (−100 ms), ⌃⌥- slower (+100 ms): like btop, "+" is faster.
@@ -342,6 +371,40 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
             webView.callAsyncJavaScript(
                 "window.kiln && window.kiln.pause && window.kiln.pause()", arguments: [:], in: nil, in: .page)
         }
+        scheduleDesktopAfterLoad(display)
+    }
+
+    // MARK: Desktop picture (Desktop.swift)
+
+    // The one timed update: once the page has loaded and drawn its data.
+    private func scheduleDesktopAfterLoad(_ display: CGDirectDisplayID) {
+        desktopAfterLoadWork[display]?.cancel()
+        guard settings.matchDesktop else { return }
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.desktopAfterLoadWork[display] = nil
+                if !self.reasons.contains(.hidden) { self.desktop.update(display, reason: "page loaded") }
+            }
+        }
+        desktopAfterLoadWork[display] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.desktopAfterLoad, execute: work)
+    }
+
+    // Paused: nobody sees the wallpaper, so a snapshot costs nothing visible. Not when hidden (the
+    // window is ordered out), not while a page-load update is still due, at most every 120 s.
+    private func desktopWhilePaused() {
+        guard settings.matchDesktop, !reasons.contains(.hidden) else { return }
+        if let last = lastPausedDesktop, Date().timeIntervalSince(last) < Self.desktopWhilePausedEvery { return }
+        let due = webViews.keys.filter { desktopAfterLoadWork[$0] == nil }
+        guard !due.isEmpty else { return }
+        lastPausedDesktop = Date()
+        for display in due { desktop.update(display, reason: stateText) }
+    }
+
+    private func updateDesktopEverywhere(reason: String) {
+        guard settings.matchDesktop, !reasons.contains(.hidden) else { return }
+        for display in webViews.keys { desktop.update(display, reason: reason) }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -376,6 +439,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
             window.orderOut(nil)
             windows[display] = nil
             webViews[display] = nil
+            desktopAfterLoadWork.removeValue(forKey: display)?.cancel()
             log("display \(display) gone: \(windows.count) window(s)")
         }
         for (display, screen) in screens {
@@ -541,6 +605,12 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshLowPower() }
         }
+        // The desktop picture is per Space; setDesktopImageURL sets only the current one.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateDesktopEverywhere(reason: "Space changed") }
+        }
         // `pkill -USR1 KilnWall` toggles show/hide; TERM and INT quit cleanly so the feed child dies too.
         onSignal(SIGUSR1) { $0.toggleShown() }
         onSignal(SIGTERM) { _ in NSApp.terminate(nil) }
@@ -589,6 +659,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         refreshMenu?.autoenablesItems = false
         refreshMenuItem = menu.addItem(withTitle: "Refresh", action: nil, keyEquivalent: "")
         refreshMenuItem?.submenu = refreshMenu
+        matchItem = menu.addItem(withTitle: "Match macOS Wallpaper", action: #selector(toggleMatchDesktop), keyEquivalent: "")
         menu.addItem(withTitle: "Reload Page", action: #selector(reloadPage), keyEquivalent: "")
         menu.addItem(withTitle: "Open Page Folder", action: #selector(openPageFolder), keyEquivalent: "")
         menu.addItem(.separator())
@@ -607,6 +678,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         showItem?.title = reasons.contains(.hidden) ? "Show Wallpaper" : "Hide Wallpaper"
         pauseItem?.title = reasons.contains(.manual) ? "Resume" : "Pause"
         loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        matchItem?.state = settings.matchDesktop ? .on : .off
         fillDesignMenu()
         fillRefreshMenu()
     }
@@ -652,11 +724,21 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
 
     @objc private func chooseDesign(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
-        choose(Settings(design: id, periodMs: settings.periodMs), source: "menu")
+        var next = settings
+        next.design = id
+        choose(next, source: "menu")
     }
 
     @objc private func chooseRefresh(_ sender: NSMenuItem) {
-        choose(Settings(design: settings.design, periodMs: Settings.clamp(sender.tag)), source: "menu")
+        var next = settings
+        next.periodMs = Settings.clamp(sender.tag)
+        choose(next, source: "menu")
+    }
+
+    @objc private func toggleMatchDesktop() {
+        var next = settings
+        next.matchDesktop.toggle()
+        choose(next, source: "menu")
     }
 
     @objc private func faster() { stepPeriod(-Settings.step, source: "menu") }

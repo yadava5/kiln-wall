@@ -4,13 +4,15 @@
 import Darwin
 import Foundation
 
-// ~/.config/kiln-wall/settings.json: {"design": "<folder id>", "period_ms": <100..1000>}.
-// Every writer (this app, the kiln-wall CLI) writes it atomically, temp file + rename.
+// ~/.config/kiln-wall/settings.json: {"design": "<folder id>", "period_ms": <100..1000>,
+// "match_desktop": <bool, default true>}, plus "original_desktop" (see OriginalDesktop), which is
+// state the app keeps, not a choice. Every writer (this app, the kiln-wall CLI) writes it
+// atomically, temp file + rename, and keeps the keys it does not know.
 struct Settings: Equatable {
     static let minPeriod = 100
     static let maxPeriod = 1000
     static let step = 100
-    static let defaults = Settings(design: "glass", periodMs: 300)
+    static let defaults = Settings(design: "glass", periodMs: 300, matchDesktop: true)
 
     static let folder = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/kiln-wall", isDirectory: true)
@@ -18,6 +20,8 @@ struct Settings: Equatable {
 
     var design: String
     var periodMs: Int
+    // Keep the macOS desktop picture matched to the wallpaper (DesktopMatcher, Desktop.swift).
+    var matchDesktop: Bool
 
     static func clamp(_ ms: Int) -> Int { min(maxPeriod, max(minPeriod, ms)) }
 
@@ -58,31 +62,107 @@ struct Settings: Equatable {
         } else {
             problems.append("period_ms \(object["period_ms"].map { "\($0)" } ?? "missing")")
         }
+        // Optional (files from before it existed lack it): missing is the default, not a problem.
+        if let value = object["match_desktop"] {
+            if let flag = value as? NSNumber, CFGetTypeID(flag) == CFBooleanGetTypeID() {
+                result.matchDesktop = flag.boolValue
+            } else {
+                problems.append("match_desktop \(value) is not true or false")
+            }
+        } else {
+            result.matchDesktop = defaults.matchDesktop
+        }
         if !problems.isEmpty {
-            log("settings: \(problems.joined(separator: "; ")); using design \(result.design), period \(result.periodMs) ms")
+            log("settings: \(problems.joined(separator: "; ")); using design \(result.design), period \(result.periodMs) ms, match desktop \(result.matchDesktop)")
         }
         return result
     }
 
-    // Keeps any other keys in the file. Same layout as the CLI's json.dumps.
     func write() throws {
-        var others: [String: Any] = [:]
-        if let data = try? Data(contentsOf: Self.file),
-           let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-            others = object
-            others["design"] = nil
-            others["period_ms"] = nil
+        try Self.rewrite { object in
+            object["design"] = design
+            object["period_ms"] = periodMs
+            object["match_desktop"] = matchDesktop
         }
-        var text = "{\"design\": \(Self.fragment(design)), \"period_ms\": \(periodMs)"
-        for key in others.keys.sorted() { text += ", \(Self.fragment(key)): \(Self.fragment(others[key]!))" }
-        text += "}\n"
-        try FileManager.default.createDirectory(at: Self.folder, withIntermediateDirectories: true)
-        try Data(text.utf8).write(to: Self.file, options: .atomic)
+    }
+
+    // Read, change, write back, keeping every key it does not touch. Same layout as the CLI's
+    // json.dumps: design and period_ms first, the rest sorted.
+    static func rewrite(_ change: (inout [String: Any]) -> Void) throws {
+        var object: [String: Any] = [:]
+        if let data = try? Data(contentsOf: file),
+           let read = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            object = read
+        }
+        change(&object)
+        let first = ["design", "period_ms"].filter { object[$0] != nil }
+        let rest = object.keys.filter { !first.contains($0) }.sorted()
+        let text = "{" + (first + rest).map { "\(fragment($0)): \(fragment(object[$0]!))" }.joined(separator: ", ") + "}\n"
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data(text.utf8).write(to: file, options: .atomic)
     }
 
     private static func fragment(_ value: Any) -> String {
         let data = try? JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed, .sortedKeys])
         return data.map { String(decoding: $0, as: UTF8.self) } ?? "null"
+    }
+}
+
+// The user's own desktop picture, saved before KilnWall first replaces it on a display and put
+// back on Quit or when matching is switched off: "original_desktop" in settings.json, keyed by
+// the display's UUID (stable across reboots and reconnection, unlike its CGDirectDisplayID):
+//   {"<uuid>": {"display": "Built-in Retina Display", "url": "file:///...", "scaling": 3,
+//               "allow_clipping": true, "fill_color": [r, g, b, a]}}
+// The options are NSWorkspace's desktop image options as plain values (fill_color in calibrated
+// RGB); Desktop.swift converts them.
+struct OriginalDesktop: Equatable {
+    static let key = "original_desktop"
+
+    var display: String
+    var url: URL
+    var scaling: Int?
+    var allowClipping: Bool?
+    var fillColor: [Double]?
+
+    init(display: String, url: URL, scaling: Int?, allowClipping: Bool?, fillColor: [Double]?) {
+        self.display = display
+        self.url = url
+        self.scaling = scaling
+        self.allowClipping = allowClipping
+        self.fillColor = fillColor
+    }
+
+    init?(json: Any) {
+        guard let object = json as? [String: Any], let text = object["url"] as? String,
+              let url = URL(string: text) else { return nil }
+        self.url = url
+        display = object["display"] as? String ?? ""
+        scaling = (object["scaling"] as? NSNumber)?.intValue
+        allowClipping = (object["allow_clipping"] as? NSNumber)?.boolValue
+        fillColor = (object["fill_color"] as? [NSNumber])?.map(\.doubleValue)
+    }
+
+    var json: [String: Any] {
+        var object: [String: Any] = ["display": display, "url": url.absoluteString]
+        if let scaling { object["scaling"] = scaling }
+        if let allowClipping { object["allow_clipping"] = allowClipping }
+        if let fillColor { object["fill_color"] = fillColor }
+        return object
+    }
+
+    static func loadAll() -> [String: OriginalDesktop] {
+        guard let data = try? Data(contentsOf: Settings.file),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let saved = object[key] as? [String: Any]
+        else { return [:] }
+        return saved.compactMapValues { OriginalDesktop(json: $0) }
+    }
+
+    // None left: the key is removed.
+    static func saveAll(_ all: [String: OriginalDesktop]) throws {
+        try Settings.rewrite { object in
+            object[key] = all.isEmpty ? nil : all.mapValues(\.json)
+        }
     }
 }
 
