@@ -4,38 +4,104 @@
 // wallpaper window, so whatever picture macOS holds flashes on screen in those transitions
 // (recorded 2026-11-05: ~0.4 s entering Mission Control, ~1 frame leaving it). So each display's
 // web view is snapshotted now and then and the snapshot set as that display's desktop picture.
-// When (main.swift decides, snapshotIfDue): only while the wallpaper runs, never while covered
-// or paused (such a view may hold nothing current); 8 s after a page load, when matching is
-// switched on, and otherwise (on a Space change, the desktop picture being per Space, and while
-// the page runs) at most once per 60 s and only if the page was sent a line since the last.
+// When (main.swift decides, snapshotIfDue): while the wallpaper runs, 8 s after a page load,
+// when matching is switched on, and otherwise (on a Space change, the desktop picture being per
+// Space, and while the page runs) at most once per 60 s and only if the page was sent a line
+// since the last; and once at once, past that throttle, when a new design or appearance has
+// painted, also while covered (main.swift draws it unseen for this).
+//
+// Every picture is tagged with what it shows, its Look (design and appearance), in its file name,
+// and is only ever shown as that look: Ayush saw the previous design for "a second or two" on
+// returning to the desktop after switching designs (2026-11-05). The host log had it: the desktop
+// picture stayed the old design for 168 s after a switch (the after-load snapshot fell under a
+// cover), and the overlay over a returning page was "the newest JPEG", of the old design. A
+// snapshot is checked against the page when it completes and again before it is set: a page
+// that changed meanwhile drops it. Until a picture of a new look exists, the desktop picture is
+// the newest older picture of that look, else a plain field of the design's background colour.
 //
 // Each snapshot goes to a new file in ~/Library/Application Support/KilnWall/desktop/ (macOS
-// caches the picture by URL, so a rewritten file would not be re-read), keeping the last two per
-// display. JPEG at quality 0.9: measured 2026-11-05 on a 3024x1964 ledger snapshot, median of 7,
-// JPEG 28.7 ms (1.9 MB), PNG 66.5 ms (1.2 MB), HEIC 0.9 68.1 ms (1.2 MB).
+// caches the picture by URL, so a rewritten file would not be re-read). Kept per display: the
+// newest two, the newest of each look (so switching back to a design has its picture at once)
+// and the one set. JPEG at quality 0.9: measured 2026-11-05 on a 3024x1964 ledger snapshot,
+// median of 7, JPEG 28.7 ms (1.9 MB), PNG 66.5 ms (1.2 MB), HEIC 0.9 68.1 ms (1.2 MB).
 //
 // The user's own picture is saved per display (OriginalDesktop, settings.json) before the first
-// change and put back on Quit and when matching is switched off.
+// change and put back on Quit and when matching is switched off. A test instance
+// (KILNWALL_TEST_HOME) never sets or restores it: it logs what it would have set.
 import AppKit
 import ImageIO
 import UniformTypeIdentifiers
 import WebKit
 
+// What a picture shows: the design (its folder id, or "_page" for the old page folder or the
+// bundled page; a design id never starts with "_") and the appearance the page was told.
+struct Look: Hashable, CustomStringConvertible {
+    let design: String
+    let appearance: String
+    var description: String { "\(design)/\(appearance)" }
+}
+
+// One file of the desktop folder: desktop-<display>-<ms>@<design>@<appearance>[@solid].jpg, the
+// design percent-encoded so "@" only separates fields. A file from before the tags
+// (desktop-<display>-<ms>.jpg) has no look and is never shown.
+struct DesktopPicture {
+    let url: URL
+    let ms: Int
+    let look: Look?
+    let solid: Bool
+
+    private static let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_."))
+
+    static func name(_ display: CGDirectDisplayID, _ look: Look, solid: Bool) -> String {
+        let design = look.design.addingPercentEncoding(withAllowedCharacters: safe) ?? "_"
+        return "desktop-\(display)-\(Int(Date().timeIntervalSince1970 * 1000))@\(design)@\(look.appearance)"
+            + (solid ? "@solid" : "") + ".jpg"
+    }
+
+    init?(_ name: String, display: CGDirectDisplayID, in folder: URL) {
+        let prefix = "desktop-\(display)-"
+        guard name.hasPrefix(prefix), name.hasSuffix(".jpg") else { return nil }
+        let fields = name.dropFirst(prefix.count).dropLast(4).split(separator: "@", omittingEmptySubsequences: false).map(String.init)
+        guard let ms = Int(fields[0]) else { return nil }
+        url = folder.appendingPathComponent(name)
+        self.ms = ms
+        if fields.count >= 3, let design = fields[1].removingPercentEncoding, !design.isEmpty, !fields[2].isEmpty {
+            look = Look(design: design, appearance: fields[2])
+        } else {
+            look = nil
+        }
+        solid = fields.count == 4 && fields[3] == "solid"
+    }
+}
+
 @MainActor
 final class DesktopMatcher {
-    nonisolated static let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("KilnWall/desktop", isDirectory: true)
+    nonisolated static let folder = KilnSupport.folder.appendingPathComponent("desktop", isDirectory: true)
     nonisolated private static let keep = 2
     nonisolated private static let quality = 0.9
+    // A snapshot whose luma varies less than this is a blank page: never written or set.
+    nonisolated static let blankLumaStd = 3.0
     private static let snapshotTimeout: TimeInterval = 10
+
+    // A snapshot asked for: a picture of `look`, good only while `isCurrent()` says the page still
+    // shows it. `completion` gets the file written (whether or not it was set), or nil.
+    struct Request {
+        let reason: String
+        let look: Look
+        let isCurrent: () -> Bool
+        var completion: (URL?) -> Void = { _ in }
+    }
 
     var enabled: Bool
     private let encoder = DispatchQueue(label: "io.github.yadava5.kilnwall.desktop", qos: .utility)
-    // One update in flight per display; a request meanwhile is held (the latest reason) and run after.
+    // One update in flight per display; a request meanwhile is held (the latest) and run after.
     private var inFlight: [CGDirectDisplayID: Int] = [:]
-    private var pending: [CGDirectDisplayID: String] = [:]
+    private var pending: [CGDirectDisplayID: Request] = [:]
     private var serial = 0
+    // The file each display's picture was last set to: never pruned.
+    private var lastSet: [CGDirectDisplayID: String] = [:]
     private let webViewFor: (CGDirectDisplayID) -> WKWebView?
+    private let testInstance = TestHome.url != nil
 
     init(enabled: Bool, webViewFor: @escaping (CGDirectDisplayID) -> WKWebView?) {
         self.enabled = enabled
@@ -45,11 +111,11 @@ final class DesktopMatcher {
     // MARK: Updating
 
     // Snapshots and writes the file whether or not matching is on (main.swift also lays the newest
-    // file over a reloading page); only `set` needs `enabled`.
-    func update(_ display: CGDirectDisplayID, reason: String) {
-        guard let webView = webViewFor(display), let screen = Self.screen(display) else { return }
+    // file of the shown look over a reloading page); only `set` needs `enabled`.
+    func update(_ display: CGDirectDisplayID, _ request: Request) {
+        guard let webView = webViewFor(display), let screen = Self.screen(display) else { return request.completion(nil) }
         if inFlight[display] != nil {
-            pending[display] = reason
+            pending.updateValue(request, forKey: display)?.completion(nil)
             return
         }
         serial += 1
@@ -63,11 +129,13 @@ final class DesktopMatcher {
         let webPID = pid_t(KilnWall.webProcessID(webView))
         let cpuBefore = webPID > 0 ? Headless.cpuSeconds(webPID) : nil
         let started = DispatchTime.now().uptimeNanoseconds
+        let look = request.look, reason = request.reason
 
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.snapshotTimeout) { [weak self] in
             MainActor.assumeIsolated {
                 guard let self, self.inFlight[display] == token else { return }
-                log("desktop: display \(display) snapshot did not complete within \(Int(Self.snapshotTimeout)) s (\(reason))")
+                log("desktop: display \(display) snapshot of \(look) did not complete within \(Int(Self.snapshotTimeout)) s (\(reason))")
+                request.completion(nil)
                 self.done(display)
             }
         }
@@ -83,27 +151,47 @@ final class DesktopMatcher {
                 var webCPU: Double?
                 if let before = cpuBefore, let after = Headless.cpuSeconds(webPID) { webCPU = (after - before) * 1000 }
                 guard let image, let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-                    log("desktop: display \(display) snapshot failed: \(error?.localizedDescription ?? "no image") (\(reason))")
+                    log("desktop: display \(display) snapshot of \(look) failed: \(error?.localizedDescription ?? "no image") (\(reason))")
+                    request.completion(nil)
                     return self.done(display)
                 }
-                log(String(format: "desktop: snapshot display %u (%@): %dx%d px in %.1f ms, WebContent CPU %@",
-                           display, reason, cgImage.width, cgImage.height, snapshotMs,
+                // A switch or an appearance change landed while it was taken: a picture of what?
+                guard request.isCurrent() else {
+                    log("desktop: display \(display) snapshot of \(look) dropped: the page changed while it was taken (\(reason))")
+                    request.completion(nil)
+                    return self.done(display)
+                }
+                log(String(format: "desktop: snapshot display %u of %@ (%@): %dx%d px in %.1f ms, WebContent CPU %@",
+                           display, look.description, reason, cgImage.width, cgImage.height, snapshotMs,
                            webCPU.map { String(format: "%.1f ms", $0) } ?? "unknown"))
-                let url = Self.folder.appendingPathComponent(
-                    "desktop-\(display)-\(Int(Date().timeIntervalSince1970 * 1000)).jpg")
+                let url = Self.folder.appendingPathComponent(DesktopPicture.name(display, look, solid: false))
+                let spare = self.lastSet[display]
                 self.encoder.async {
                     let encodeStarted = DispatchTime.now().uptimeNanoseconds
-                    let result = Self.write(cgImage, width: width, height: height, to: url)
+                    let result: Result<(Int, Bool), Problem>
+                    if let stats = Self.lumaStats(cgImage), stats.std < Self.blankLumaStd {
+                        result = .failure(Problem(message: String(
+                            format: "snapshot of %@ refused: blank (luma mean %.1f std %.1f)", look.description, stats.mean, stats.std)))
+                    } else {
+                        result = Self.write(cgImage, width: width, height: height, to: url)
+                    }
                     let encodeMs = Self.ms(since: encodeStarted)
-                    if case .success = result { Self.prune(display) }
+                    if case .success = result { Self.prune(display, sparing: spare) }
                     DispatchQueue.main.async {
                         MainActor.assumeIsolated {
                             guard self.inFlight[display] == token else { return }
                             switch result {
                             case .success(let (bytes, redrawn)):
-                                self.set(display, url, bytes: bytes, redrawn: redrawn, encodeMs: encodeMs, reason: reason)
+                                if request.isCurrent() {
+                                    self.set(display, url, look: look, reason: reason, detail: String(
+                                        format: "%d bytes; JPEG encode + write %.1f ms%@", bytes, encodeMs, redrawn ? " (redrawn to fit)" : ""))
+                                } else {
+                                    log("desktop: display \(display) wrote \(url.lastPathComponent) but did not set it: the page changed meanwhile (\(reason))")
+                                }
+                                request.completion(url)
                             case .failure(let problem):
                                 log("desktop: display \(display): \(problem.message)")
+                                request.completion(nil)
                             }
                             self.done(display)
                         }
@@ -115,12 +203,50 @@ final class DesktopMatcher {
 
     private func done(_ display: CGDirectDisplayID) {
         inFlight[display] = nil
-        if let reason = pending.removeValue(forKey: display) { update(display, reason: reason) }
+        if let next = pending.removeValue(forKey: display) { update(display, next) }
     }
 
-    private func set(_ display: CGDirectDisplayID, _ url: URL, bytes: Int, redrawn: Bool, encodeMs: Double, reason: String) {
+    // A picture already on disk (an older snapshot of the look now shown), set at once.
+    func setPicture(_ display: CGDirectDisplayID, _ picture: DesktopPicture, reason: String) {
+        guard let look = picture.look else { return }
+        let age = Double(Int(Date().timeIntervalSince1970 * 1000) - picture.ms) / 1000
+        set(display, picture.url, look: look, reason: reason, detail: String(format: "an older picture of it, %.0f s old", age))
+    }
+
+    // No picture of the look yet: a plain field of its background colour, never another design.
+    // Written off the main thread (64x40 px; macOS fills the screen with it) and set unless the
+    // look has changed again by then.
+    func setSolid(_ display: CGDirectDisplayID, _ colour: NSColor, look: Look, reason: String, isCurrent: @escaping () -> Bool) {
+        guard enabled, Self.screen(display) != nil, let rgb = colour.usingColorSpace(.sRGB) else { return }
+        let components = [rgb.redComponent, rgb.greenComponent, rgb.blueComponent]
+        let hex = components.map { String(format: "%02x", Int(($0 * 255).rounded())) }.joined()
+        let url = Self.folder.appendingPathComponent(DesktopPicture.name(display, look, solid: true))
+        let spare = lastSet[display]
+        encoder.async {
+            let result = Self.writeSolid(components, to: url)
+            if case .success = result { Self.prune(display, sparing: spare) }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    switch result {
+                    case .success:
+                        guard isCurrent() else { return log("desktop: display \(display) solid for \(look) not set: the page changed meanwhile") }
+                        self.set(display, url, look: look, reason: reason, detail: "a solid #\(hex), no picture of it yet")
+                    case .failure(let problem):
+                        log("desktop: display \(display): \(problem.message)")
+                    }
+                }
+            }
+        }
+    }
+
+    // Every use of the desktop picture is logged with the look it shows.
+    private func set(_ display: CGDirectDisplayID, _ url: URL, look: Look, reason: String, detail: String) {
         // Switched off (or the display went) while the snapshot was being written.
         guard enabled, let screen = Self.screen(display) else { return }
+        if testInstance {
+            lastSet[display] = url.lastPathComponent
+            return log("desktop: test instance, display \(display) NOT set (would be \(url.lastPathComponent), design \(look.design), appearance \(look.appearance); \(detail)) (\(reason))")
+        }
         guard saveOriginal(display, screen) else { return }
         let started = DispatchTime.now().uptimeNanoseconds
         do {
@@ -131,8 +257,9 @@ final class DesktopMatcher {
         } catch {
             return log("desktop: display \(display): cannot set \(url.path): \(error.localizedDescription)")
         }
-        log(String(format: "desktop: set display %u to %@, %d bytes; JPEG encode + write %.1f ms%@, set %.1f ms",
-                   display, url.path, bytes, encodeMs, redrawn ? " (redrawn to fit)" : "", Self.ms(since: started)))
+        lastSet[display] = url.lastPathComponent
+        log(String(format: "desktop: set display %u to %@, design %@, appearance %@; %@, set %.1f ms (%@)",
+                   display, url.path, look.design, look.appearance, detail, Self.ms(since: started), reason))
     }
 
     // MARK: The user's own picture
@@ -169,6 +296,7 @@ final class DesktopMatcher {
     // change saves whatever is there then. A saved entry stays while its display is absent or its
     // file is gone. setDesktopImageURL reaches only the current Space.
     func restore(reason: String) {
+        guard !testInstance else { return }
         let originals = OriginalDesktop.loadAll()
         guard !originals.isEmpty else { return }
         var left = originals
@@ -226,18 +354,32 @@ final class DesktopMatcher {
             context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
             opaque = context.makeImage()
         }
+        guard let opaque else { return .failure(Problem(message: "cannot write \(url.path)")) }
+        return encode(opaque, to: url).map { ($0, redrawn) }
+    }
+
+    nonisolated private static func writeSolid(_ rgb: [CGFloat], to url: URL) -> Result<Int, Problem> {
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(data: nil, width: 64, height: 40, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+        else { return .failure(Problem(message: "cannot make a solid bitmap")) }
+        context.setFillColor(CGColor(colorSpace: space, components: rgb + [1]) ?? CGColor(gray: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 64, height: 40))
+        guard let image = context.makeImage() else { return .failure(Problem(message: "cannot make a solid bitmap")) }
+        return encode(image, to: url)
+    }
+
+    nonisolated private static func encode(_ image: CGImage, to url: URL) -> Result<Int, Problem> {
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         } catch {
             return .failure(Problem(message: "cannot create \(folder.path): \(error.localizedDescription)"))
         }
-        guard let opaque,
-              let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil)
+        guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil)
         else { return .failure(Problem(message: "cannot write \(url.path)")) }
-        CGImageDestinationAddImage(destination, opaque, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { return .failure(Problem(message: "cannot write \(url.path)")) }
-        let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
-        return .success((bytes, redrawn))
+        return .success((try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0)
     }
 
     nonisolated private static func asOpaque(_ image: CGImage) -> CGImage? {
@@ -256,26 +398,61 @@ final class DesktopMatcher {
                        intent: image.renderingIntent)
     }
 
-    // The newest `keep` of this display's files stay (names sort by time); only this folder and
-    // only names this app writes are touched.
-    nonisolated private static func prune(_ display: CGDirectDisplayID) {
-        for name in pictures(display).dropLast(keep) {
-            try? FileManager.default.removeItem(at: folder.appendingPathComponent(name))
+    // Luma over a 48x30 grid: a populated page has a std of ~20 (glass), a blank one under 3.
+    nonisolated static func lumaStats(_ image: CGImage) -> (mean: Double, std: Double)? {
+        let width = 48, height = 30
+        var pixels = [UInt8](repeating: 0, count: width * height)
+        let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(
+                data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width,
+                space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)
+            else { return false }
+            context.interpolationQuality = .medium
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard drawn else { return nil }
+        let count = Double(pixels.count)
+        let mean = pixels.reduce(0.0) { $0 + Double($1) } / count
+        let variance = pixels.reduce(0.0) { $0 + (Double($1) - mean) * (Double($1) - mean) } / count
+        return (mean, variance.squareRoot())
+    }
+
+    // Kept: the newest `keep` files, the newest picture of each look, and the file last set
+    // (`sparing`). Only this folder and only names this app writes are touched.
+    nonisolated private static func prune(_ display: CGDirectDisplayID, sparing: String?) {
+        let all = pictures(display)
+        var kept = Set(all.suffix(keep).map(\.url.lastPathComponent))
+        if let sparing { kept.insert(sparing) }
+        var looks: Set<Look> = []
+        for picture in all.reversed() where !picture.solid {
+            if let look = picture.look, looks.insert(look).inserted { kept.insert(picture.url.lastPathComponent) }
+        }
+        for picture in all where !kept.contains(picture.url.lastPathComponent) {
+            try? FileManager.default.removeItem(at: picture.url)
         }
     }
 
-    // This display's newest picture, if any: what main.swift lays over a page that reloads
-    // unplanned (its WebContent process ended), when there is nothing live to snapshot.
-    nonisolated static func newestPicture(_ display: CGDirectDisplayID) -> URL? {
-        pictures(display).last.map { folder.appendingPathComponent($0) }
+    // This display's newest picture of `look` (never a solid), if any: what main.swift lays over
+    // a page that reloads or returns, and the desktop picture until a fresh one is taken.
+    nonisolated static func newestPicture(_ display: CGDirectDisplayID, of look: Look) -> DesktopPicture? {
+        pictures(display).last { !$0.solid && $0.look == look }
+    }
+
+    // The newest picture of each design (any appearance), for the menu's design pictures.
+    nonisolated static func newestByDesign(_ display: CGDirectDisplayID) -> [String: DesktopPicture] {
+        var newest: [String: DesktopPicture] = [:]
+        for picture in pictures(display) where !picture.solid {
+            if let design = picture.look?.design { newest[design] = picture }
+        }
+        return newest
     }
 
     // Oldest first.
-    nonisolated private static func pictures(_ display: CGDirectDisplayID) -> [String] {
-        let prefix = "desktop-\(display)-"
-        return ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
-            .filter { $0.hasPrefix(prefix) && $0.hasSuffix(".jpg") }
-            .sorted { $0.count != $1.count ? $0.count < $1.count : $0 < $1 }
+    nonisolated private static func pictures(_ display: CGDirectDisplayID) -> [DesktopPicture] {
+        ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
+            .compactMap { DesktopPicture($0, display: display, in: folder) }
+            .sorted { $0.ms != $1.ms ? $0.ms < $1.ms : $0.url.lastPathComponent < $1.url.lastPathComponent }
     }
 
     private static func isOurs(_ url: URL) -> Bool {
@@ -306,6 +483,61 @@ final class DesktopMatcher {
 
     nonisolated private static func ms(since start: UInt64) -> Double {
         Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+    }
+}
+
+// Each look's page background colour, learned from the page (main.swift's readBackground) and
+// kept in backgrounds.json: what the window and a solid picture show for a look that has no
+// picture yet, instead of another design.
+@MainActor
+enum DesignBackgrounds {
+    private static let file = KilnSupport.folder.appendingPathComponent("backgrounds.json")
+    private static var known: [String: String] = {
+        guard let data = try? Data(contentsOf: file),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: String] else { return [:] }
+        return object
+    }()
+
+    private static func key(_ look: Look) -> String { "\(look.design)@\(look.appearance)" }
+
+    // The look's own colour; else the average of the design's picture in the menu's grid (all
+    // designs shown before have one, so a fresh install's first switch is not a neutral); else
+    // the design's colour in another appearance; else a neutral for it.
+    static func colour(for look: Look) -> (colour: NSColor, source: String) {
+        if let css = known[key(look)], let colour = KilnWall.opaqueColour(css) { return (colour, "its page's \(css)") }
+        if let colour = average(DesignPictures.url(look.design)) { return (colour, "its grid picture's average") }
+        if let (other, css) = known.first(where: { $0.key.hasPrefix(look.design + "@") }), let colour = KilnWall.opaqueColour(css) {
+            return (colour, "\(other)'s \(css)")
+        }
+        let light = look.appearance == Appearance.light.rawValue
+        return (NSColor(white: light ? 0.95 : 0.11, alpha: 1), "neutral \(light ? "light" : "dark")")
+    }
+
+    private static func average(_ url: URL) -> NSColor? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let small = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 32,
+              ] as CFDictionary),
+              let space = CGColorSpace(name: CGColorSpace.sRGB)
+        else { return nil }
+        var pixel = [UInt8](repeating: 0, count: 4)
+        let drawn = pixel.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(data: buffer.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                          space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return false }
+            context.interpolationQuality = .medium
+            context.draw(small, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+            return true
+        }
+        guard drawn else { return nil }
+        return NSColor(srgbRed: Double(pixel[0]) / 255, green: Double(pixel[1]) / 255, blue: Double(pixel[2]) / 255, alpha: 1)
+    }
+
+    static func learn(_ css: String, for look: Look) {
+        guard known[key(look)] != css else { return }
+        known[key(look)] = css
+        guard let data = try? JSONSerialization.data(withJSONObject: known, options: [.sortedKeys]) else { return }
+        try? FileManager.default.createDirectory(at: KilnSupport.folder, withIntermediateDirectories: true)
+        try? data.write(to: file, options: .atomic)
     }
 }
 

@@ -3,8 +3,9 @@
 // One borderless window per screen sits one level below the desktop icons (so above LiveWall's
 // video, which sits at the desktop level) and holds a WKWebView showing the chosen design,
 // ~/.config/kiln-wall/designs/<design>/index.html. Each JSON line from the feed (Feed.swift) is
-// handed to the page as its raw text, window.kiln.update(line), and the design and refresh period (100..1000 ms,
-// settings.json, see Settings.swift) as window.kiln.config({design, period_ms}). Whenever nobody
+// handed to the page as its raw text, window.kiln.update(line), and the design, refresh period (100..1000 ms),
+// appearance and temperature unit (settings.json, see Settings.swift) as
+// window.kiln.config({design, period_ms, appearance, temp_unit}). Whenever nobody
 // can see the wallpaper the page is told window.kiln.pause() and the feed is stopped, except
 // under a cover (a window or full-screen Space over the desktop): then the feed runs on for a
 // grace period at 1 s, its lines kept but not sent, so a quick return shows the latest state at
@@ -51,8 +52,12 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private static let desktopAfterLoad: TimeInterval = 8
     private static let snapshotEvery: TimeInterval = 60
     private static let snapshotSettle: TimeInterval = 2
-    // An overlay picture whose luma varies less than this is a blank page: not shown.
-    private static let blankLumaStd = 3.0
+    // A page told a new appearance re-renders at once (Kiln.onPrefs); the designs' longest colour
+    // transition is 0.6 s (bento, flightdeck, ledger), so it counts as drawn two frames and this
+    // long after the config.
+    private static let appearanceSettle: TimeInterval = 0.7
+    // Drawing a new look while nobody sees the page (renderUnseen) gives up after this.
+    private static let unseenTimeout: TimeInterval = 10
     // Covered: the feed is kept this long at coveredPeriodMs, so a return within it shows the
     // state of a second ago at once. Measured 2026-11-05 (kiln-feed --stream --period-ms 1000,
     // 150 s, load average 2.3-3.5): own CPU 1.17% of a core (0.87-1.43% per 30 s), 2.5% with the
@@ -65,8 +70,6 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     // page has painted its first line, and goes after overlayTimeout anyway (while it is seen).
     private static let overlayFade: TimeInterval = 0.2
     private static let overlayTimeout: TimeInterval = 3
-    // Until a page reports its own: glass's #0b1120 (the default design).
-    private static let defaultBackground = NSColor(srgbRed: 11 / 255, green: 17 / 255, blue: 32 / 255, alpha: 1)
 
     private var windows: [CGDirectDisplayID: NSWindow] = [:]
     private var webViews: [CGDirectDisplayID: WKWebView] = [:]
@@ -79,7 +82,8 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private var graceCPU: Double?
     // Lines kept since the page was last sent one: it is sent `replay.latest()` when it runs again.
     private var heldUnsent = false
-    private var overlays: [CGDirectDisplayID: (view: NSImageView, since: Date)] = [:]
+    // `look`: what the overlay's picture shows (nil: unknown).
+    private var overlays: [CGDirectDisplayID: (view: NSImageView, since: Date, look: Look?)] = [:]
     private var overlayTimeouts: [CGDirectDisplayID: DispatchWorkItem] = [:]
     private var snapshotting: Set<CGDirectDisplayID> = []
     // Test hook, only with KILNWALL_TEST_COVER=1 in the environment: SIGUSR2 flips a forced
@@ -97,9 +101,23 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private var signals: [DispatchSourceSignal] = []
     private var statusItem: NSStatusItem?
     private var menu: KilnMenu?
-    // When the shown design last painted: a desktop snapshot newer than this is a picture of it,
-    // for the menu's design grid (DesignPictures, Menu.swift).
-    private var painted: (design: String, at: Date)?
+    // What each display's page shows, so every picture of it is tagged with its look (Look,
+    // Desktop.swift). `generation` counts loads, design switches and appearance changes. The page
+    // should show `wanted`; `loading` is its latest load; `drawn` is what is known on screen (the
+    // load posted {painted}, or two frames and a settle passed after a config). A snapshot is
+    // taken, written and set only while drawn and wanted are the same generation.
+    private var generation = 0
+    private var loading: [CGDirectDisplayID: (gen: Int, look: Look)] = [:]
+    private var wanted: [CGDirectDisplayID: (gen: Int, look: Look)] = [:]
+    private var drawn: [CGDirectDisplayID: (gen: Int, look: Look)] = [:]
+    // Drew a frame since the wallpaper last started running: a snapshot now is of the page as it is.
+    private var drawnSinceRun: Set<CGDirectDisplayID> = []
+    // A new design or appearance: one snapshot as soon as it has drawn, past the 60 s throttle.
+    private var freshDue: Set<CGDirectDisplayID> = []
+    // Drawing a new look while nobody sees it (renderUnseen): the time limit.
+    private var unseen: [CGDirectDisplayID: DispatchWorkItem] = [:]
+    // KILNWALL_TEST_HOME: a test instance (see applicationDidFinishLaunching).
+    private let testInstance = TestHome.url != nil
     private let feed = Feed()
     private var acknowledged = 0
     private var scriptErrors = 0
@@ -116,16 +134,26 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private var reloadOnRun = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        log("started; design \(settings.design), period \(settings.periodMs) ms, match desktop \(settings.matchDesktop); designs in \(Designs.root.path)")
+        log("started; \(settings.summary); designs in \(Designs.root.path)")
         logTarget()
         // Matching was switched off while this was not running (or it quit without restoring).
         if !settings.matchDesktop { desktop.restore(reason: "matching is off") }
         feed.setPeriod(settings.periodMs)
         feed.onLine = { [weak self] line in self?.push(line) }
-        buildStatusItem()
+        // A test instance runs the wallpaper's own code paths beside the live one without touching
+        // anything of it or of the screen: its own settings.json and pictures (TestHome), no
+        // menu-bar item, no hotkeys, invisible windows below the desktop, the desktop picture only
+        // logged, and covered only by SIGUSR2 (with KILNWALL_TEST_COVER=1). Its design or appearance
+        // is switched by writing its settings.json, which takes the menu's path from applySettings.
+        if testInstance {
+            forcedCover = false
+            log("test: instance in \(TestHome.url!.path): no menu-bar item or hotkeys, invisible windows, desktop picture never set")
+        } else {
+            buildStatusItem()
+            registerHotkeys()
+        }
         watchPageFolder()
         settingsWatcher = SettingsWatcher { [weak self] in self?.settingsFileChanged() }
-        registerHotkeys()
         watchSystem()
         syncWindows()
         refreshLowPower()
@@ -161,13 +189,19 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
                 endGrace()
                 feed.setPeriod(settings.periodMs)
                 feed.start()
+                for display in Array(unseen.keys) { endUnseen(display, why: "running again") }
                 if reloadOnRun {
-                    // Changed while nobody could see it: reload now, under the last snapshot.
+                    // Changed while nobody could see it: reload now, under the newest picture of the
+                    // look it will show; a page still showing an older look gets that look's
+                    // colour rather than staying in view.
                     reloadOnRun = false
                     log("page: reloading on return (changed while paused)")
                     for (display, webView) in webViews {
-                        if overlays[display] != nil || showNewestPicture(display, why: "reload on return") {
-                            load(webView)
+                        if overlays[display] == nil, !showCurrentPicture(display, why: "reload on return"), showsOldLook(display) {
+                            showSolid(display, why: "reload on return")
+                        }
+                        if overlays[display] != nil {
+                            load(display, webView)
                         } else {
                             reload(display, webView)  // no picture yet: a snapshot of the page first
                         }
@@ -175,9 +209,13 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
                 } else {
                     // Past the grace, cover the return with the last snapshot until the page's first
                     // frame after resume: in case WebKit dropped the pixels of a long-hidden page.
-                    if away >= Self.coveredGrace {
-                        for display in webViews.keys where overlays[display] == nil {
-                            showNewestPicture(display, why: String(format: "return after %.0f s", away))
+                    // Likewise a page told a new appearance while hidden, which it has not drawn.
+                    for display in webViews.keys where overlays[display] == nil {
+                        if away >= Self.coveredGrace {
+                            showCurrentPicture(display, why: String(format: "return after %.0f s", away))
+                        } else if let want = wanted[display], drawn[display]?.gen != want.gen,
+                                  (drawn[display]?.gen ?? -1) >= (loading[display]?.gen ?? 0) {
+                            showCurrentPicture(display, why: "return to an appearance not drawn yet")
                         }
                     }
                     // While the page is still paused, so its figures snap to the state instead of
@@ -185,12 +223,13 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
                     if heldUnsent { sendLatest(why: kept ? "uncovered within the grace" : "running again") }
                 }
                 evaluateEverywhere("window.kiln && window.kiln.resume && window.kiln.resume()")
-                liftOverlaysAfterFirstFrame()
+                afterResume()
                 for display in overlays.keys where overlayTimeouts[display] == nil { armOverlayTimeout(display) }
                 log((kept ? "running (feed kept through the cover, \(feed.mode))" : "running") + String(format: " after %.1f s paused", away))
             } else {
                 pausedSince = Date()
                 runningSince = .distantFuture
+                drawnSinceRun = []
                 if reasons == [.covered] { startGrace() } else { feed.stop() }
                 evaluateEverywhere("window.kiln && window.kiln.pause && window.kiln.pause()")
                 log("paused: \(stateText)")
@@ -261,6 +300,13 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             // Held under a cover, the feed stays slow; uncovering restores settings.periodMs.
             if !holding { feed.setPeriod(new.periodMs) }
         }
+        if new.tempUnit != old.tempUnit {
+            log("temperature unit °\(old.tempUnit.rawValue) -> °\(new.tempUnit.rawValue) (\(source))")
+        }
+        let appearanceChanged = new.appearance != old.appearance
+        if appearanceChanged {
+            log("appearance \(old.appearance.rawValue) -> \(new.appearance.rawValue) (\(source))")
+        }
         // A new design reloads the page, and the load schedules the desktop picture's update.
         if new.design != old.design {
             log("design \(old.design) -> \(new.design) (\(source))")
@@ -275,14 +321,16 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
                 desktop.restore(reason: "matching switched off")
             }
         }
+        // Appearance and unit apply live: the runtime re-renders on config (Kiln.onPrefs), no reload.
         configureEverywhere()
+        if appearanceChanged { appearanceSent() }
         menu?.refresh()
     }
 
     // A choice made here: apply, then record it in settings.json.
     private func choose(_ new: Settings, source: String) {
         if new == settings {
-            log("\(source): already design \(new.design), period \(new.periodMs) ms, match desktop \(new.matchDesktop)")
+            log("\(source): already \(new.summary)")
             return
         }
         applySettings(new, source: source)
@@ -332,7 +380,195 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         target = next
         logTarget()
         watchPageFolder()
-        reloadPages()
+        lookChanged("design \(currentLook.design)")
+        reloadPages(newLook: true)
+    }
+
+    // MARK: Looks: which design and appearance a picture shows
+
+    // The design (or "_page" for a page that is not a design) and appearance the page is told now.
+    private var currentLook: Look {
+        Look(design: target.design ?? "_page", appearance: settings.appearance.rawValue)
+    }
+
+    private func pageShowsCurrent(_ display: CGDirectDisplayID) -> Bool {
+        guard let want = wanted[display], let have = drawn[display] else { return false }
+        return want.gen == have.gen
+    }
+
+    // The page on screen is of a look other than the one chosen (it has not drawn the new one).
+    private func showsOldLook(_ display: CGDirectDisplayID) -> Bool {
+        guard let have = drawn[display] else { return false }
+        return have.look != currentLook
+    }
+
+    // A new design or appearance. Nothing of the old look may stand in for the new one from here:
+    // every snapshot of the old page under way is dropped (`wanted` moves on); the desktop picture
+    // becomes the newest picture of the new look, else a plain field of its background colour, at
+    // once; and the new look's first drawing is snapshotted as soon as it is on screen, past the
+    // 60 s throttle (freshDue), which sets the desktop picture to it.
+    private func lookChanged(_ why: String) {
+        let look = currentLook
+        for display in webViews.keys {
+            generation += 1
+            wanted[display] = (generation, look)
+            freshDue.insert(display)
+            guard settings.matchDesktop else { continue }
+            if let picture = DesktopMatcher.newestPicture(display, of: look) {
+                desktop.setPicture(display, picture, reason: "\(why), until it is drawn")
+            } else {
+                let background = DesignBackgrounds.colour(for: look)
+                desktop.setSolid(display, background.colour, look: look, reason: "\(why), until it is drawn; \(background.source)") {
+                    [weak self] in self?.currentLook == look
+                }
+            }
+        }
+    }
+
+    // The page has been sent a new appearance (configureEverywhere); it re-renders itself.
+    private func appearanceSent() {
+        lookChanged("appearance \(settings.appearance.rawValue)")
+        for (display, webView) in webViews {
+            guard let want = wanted[display] else { continue }
+            if webView.isLoading || (drawn[display]?.gen ?? -1) < (loading[display]?.gen ?? 0) {
+                // Still loading: its own {painted} comes after its config, which carries this.
+                loading[display] = want
+            } else if running, isShown(display) {
+                settleThenDrawn(display, webView, gen: want.gen)
+            } else if !reasons.contains(.hidden) {
+                renderUnseen(display, webView, .reconfigured)
+            }
+            // Hidden: drawn after the first frames once it is shown again (afterResume).
+        }
+    }
+
+    // Two frames and the designs' colour transitions after a config: the page shows `gen`.
+    private func settleThenDrawn(_ display: CGDirectDisplayID, _ webView: WKWebView, gen: Int) {
+        afterFrames(webView, display) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.appearanceSettle) {
+                MainActor.assumeIsolated {
+                    guard let self, self.webViews[display] === webView, let want = self.wanted[display], want.gen == gen
+                    else { return }
+                    self.drawn[display] = want
+                    log(String(format: "page on display %u shows %@ (two frames and %.1f s after its config)",
+                               display, want.look.description, Self.appearanceSettle))
+                    self.readBackground(display, webView, look: want.look)
+                    if self.running {
+                        self.drawnSinceRun.insert(display)
+                        self.snapshotIfDue(display, reason: "new appearance drawn")
+                    } else if self.unseen[display] != nil {
+                        self.unseenDrawn(display)
+                    }
+                }
+            }
+        }
+    }
+
+    // `body` once the page has drawn two frames from now; never if it navigates meanwhile or is
+    // not drawing (a page WebKit counts unseen gets no frames).
+    private func afterFrames(_ webView: WKWebView, _ display: CGDirectDisplayID, _ body: @escaping () -> Void) {
+        webView.callAsyncJavaScript(
+            "await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))",
+            arguments: [:], in: nil, in: .page
+        ) { [weak self] result in
+            guard let self, self.webViews[display] === webView, case .success = result else { return }
+            body()
+        }
+    }
+
+    private func requestSnapshot(_ display: CGDirectDisplayID, reason: String, completion: @escaping (URL?) -> Void = { _ in }) {
+        guard let want = wanted[display] else { return completion(nil) }
+        desktop.update(display, .init(reason: reason, look: want.look, isCurrent: { [weak self] in
+            guard let self else { return false }
+            return self.wanted[display]?.gen == want.gen && self.drawn[display]?.gen == want.gen
+        }, completion: completion))
+    }
+
+    // MARK: Drawing a new look unseen
+
+    // A design switch or an appearance change while the wallpaper is paused with its windows in
+    // (covered, locked, Low Power Mode, paused by you): the page is loaded or re-rendered and
+    // drawn NOW, so the desktop picture shows the new look before Ayush is back on the desktop and
+    // the window holds it from the first frame of the return. cc3a2b8 deferred these to the
+    // return, which showed the old design there for a second or so: in the Space animation (the
+    // desktop picture) and in the window until the reload painted. WebKit does not draw a page it
+    // counts unseen, so its occlusion check is off for this page until the snapshot is written,
+    // at most unseenTimeout. The new look's picture or colour covers the window meanwhile, in
+    // case the return comes first. (Not at a launch under a cover: the feed has not started, so
+    // the page has no first line to paint; tried 2026-11-05, "not drawn within 10 s".)
+    private enum UnseenDraw {
+        case reload        // a new design: load it
+        case reconfigured  // a new appearance: the page re-renders on its config
+    }
+
+    private func renderUnseen(_ display: CGDirectDisplayID, _ webView: WKWebView, _ draw: UnseenDraw) {
+        coverWithCurrentLook(display, why: "new look while paused")
+        unseen[display]?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.endUnseen(display, why: "not drawn within \(Int(Self.unseenTimeout)) s") }
+        }
+        unseen[display] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.unseenTimeout, execute: work)
+        applyOcclusionDetection(display)
+        log("page: drawing \(currentLook) unseen on display \(display) (\(stateText))")
+        switch draw {
+        case .reload: load(display, webView)
+        case .reconfigured: if let want = wanted[display] { settleThenDrawn(display, webView, gen: want.gen) }
+        }
+    }
+
+    // Drawn unseen: snapshotted, which sets the desktop picture, and that picture becomes the
+    // window's cover until the return.
+    private func unseenDrawn(_ display: CGDirectDisplayID) {
+        freshDue.remove(display)
+        let look = currentLook
+        requestSnapshot(display, reason: "drawn unseen") { [weak self] url in
+            guard let self else { return }
+            if let url, !self.running, self.overlays[display] != nil, let image = NSImage(contentsOf: url) {
+                self.showOverlay(display, image, look: look, from: "\(url.lastPathComponent) (drawn unseen)")
+            }
+            if url == nil { self.freshDue.insert(display) }
+            self.endUnseen(display, why: url == nil ? "no snapshot" : "snapshot written")
+        }
+    }
+
+    private func endUnseen(_ display: CGDirectDisplayID, why: String) {
+        guard let work = unseen.removeValue(forKey: display) else { return }
+        work.cancel()
+        applyOcclusionDetection(display)
+        log("page: unseen drawing on display \(display) ended (\(why))")
+    }
+
+    // WebKit's occlusion check stays on (a covered page draws nothing), except while drawing a
+    // new look unseen, and in a test instance whose invisible window stands in for a shown one.
+    // WebKit reads the check only when the window's occlusion changes, so the change is posted:
+    // measured 2026-11-05 on a test instance, a design switched under a cover with the check
+    // merely turned off was "not drawn within 10 s", as with it left on (the control); with this
+    // post it painted 0.11 s after the switch.
+    fileprivate func applyOcclusionDetection(_ display: CGDirectDisplayID) {
+        guard let webView = webViews[display] else { return }
+        let on = unseen[display] == nil && !(testInstance && forcedCover == false)
+        if !Self.setOcclusionDetection(webView, on) { log("page: cannot turn WebKit's occlusion check \(on ? "on" : "off")") }
+        if let window = windows[display] {
+            NotificationCenter.default.post(name: NSWindow.didChangeOcclusionStateNotification, object: window)
+        }
+    }
+
+    // Private WKWebView API (-_setWindowOcclusionDetectionEnabled:, in WebKit since 2017): with it
+    // off, WebKit counts the view visible whenever its window is ordered in. True if it took.
+    @discardableResult
+    static func setOcclusionDetection(_ webView: WKWebView, _ on: Bool) -> Bool {
+        let setter = NSSelectorFromString("_setWindowOcclusionDetectionEnabled:")
+        guard webView.responds(to: setter) else { return false }
+        typealias SetBool = @convention(c) (AnyObject, Selector, Bool) -> Void
+        unsafeBitCast(webView.method(for: setter), to: SetBool.self)(webView, setter, on)
+        return (webView.value(forKey: "_windowOcclusionDetectionEnabled") as? NSNumber)?.boolValue == on
+    }
+
+    // Whether the window is on screen: the window server's word, or in a test instance the forced cover.
+    private func isShown(_ display: CGDirectDisplayID) -> Bool {
+        if testInstance { return forcedCover != true }
+        return windows[display]?.occlusionState.contains(.visible) == true
     }
 
     private func logTarget() {
@@ -345,7 +581,8 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
     // What the page is told: the design it is (the chosen one, or the fallback actually shown).
     private var pageConfig: [String: Any] {
-        ["design": target.design ?? settings.design, "period_ms": settings.periodMs]
+        ["design": target.design ?? settings.design, "period_ms": settings.periodMs,
+         "appearance": settings.appearance.rawValue, "temp_unit": settings.tempUnit.rawValue]
     }
 
     private func configureEverywhere() {
@@ -396,7 +633,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         }
     }
 
-    // {design, period_ms} for the page: after every load and on every change.
+    // {design, period_ms, appearance, temp_unit} for the page: after every load and on every change.
     static func configure(_ webView: WKWebView, _ config: [String: Any], onError: @escaping (Error) -> Void) {
         webView.callAsyncJavaScript(
             "window.kiln && window.kiln.config && window.kiln.config(c)", arguments: ["c": config], in: nil, in: .page
@@ -405,7 +642,10 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         }
     }
 
-    private func load(_ webView: WKWebView) {
+    private func load(_ display: CGDirectDisplayID, _ webView: WKWebView) {
+        generation += 1
+        loading[display] = (generation, currentLook)
+        wanted[display] = loading[display]
         Self.loadPage(webView, target)
     }
 
@@ -450,9 +690,17 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     }
 
     // A reload this app decides on (a design file changed, a design switch, the menu's Reload): a
-    // snapshot of the page as it is goes over it first, so the reload never shows blank.
-    private func reloadPages() {
+    // snapshot of the page as it is goes over it first, so the reload never shows blank; for a
+    // new design, a picture of the new one (or its colour), never the old. While paused, a page
+    // file change waits for the return; a new design is drawn now, unseen (renderUnseen), unless
+    // the wallpaper is hidden.
+    private func reloadPages(newLook: Bool = false) {
         guard running else {
+            if newLook, !reasons.contains(.hidden) {
+                reloadOnRun = false  // this load reads every file afresh
+                for (display, webView) in webViews { renderUnseen(display, webView, .reload) }
+                return
+            }
             if !reloadOnRun { log("page: reload deferred until the wallpaper runs (\(stateText))") }
             reloadOnRun = true
             return
@@ -461,16 +709,21 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     }
 
     private func reload(_ display: CGDirectDisplayID, _ webView: WKWebView) {
+        // A new design: its own picture or colour over the old page, not a snapshot of the old.
+        if showsOldLook(display) {
+            coverWithCurrentLook(display, why: "new design")
+            return load(display, webView)
+        }
         // Still covering a load that has not painted: that picture is the right one, not a new
         // snapshot of a half-loaded page.
         if overlays[display] != nil {
             armOverlayTimeout(display)
-            return load(webView)
+            return load(display, webView)
         }
-        // Only a page on screen is snapshotted; otherwise the newest snapshot of one.
-        guard windows[display]?.occlusionState.contains(.visible) == true else {
-            showNewestPicture(display, why: "reload")
-            return load(webView)
+        // Only a page on screen is snapshotted; otherwise the newest snapshot of its look.
+        guard isShown(display) else {
+            showCurrentPicture(display, why: "reload")
+            return load(display, webView)
         }
         // A snapshot already under way loads the page (the current target) when it completes.
         guard snapshotting.insert(display).inserted else { return }
@@ -483,12 +736,13 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
                 self.snapshotting.remove(display)
                 guard self.webViews[display] === webView else { return }
                 let ms = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e6
-                if let image, self.showOverlay(display, image, from: String(format: "a snapshot of the running page (%.0f ms)", ms)) {
+                if let image, self.showOverlay(display, image, look: self.drawn[display]?.look,
+                                               from: String(format: "a snapshot of the running page (%.0f ms)", ms)) {
                 } else {
                     if image == nil { log("overlay: display \(display) snapshot failed: \(error?.localizedDescription ?? "no image")") }
-                    self.showNewestPicture(display, why: "reload")
+                    self.showCurrentPicture(display, why: "reload")
                 }
-                self.load(webView)
+                self.load(display, webView)
             }
         }
     }
@@ -555,9 +809,23 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         let display = webViews.first { $0.value === message.webView }?.key ?? 0
         // kiln-runtime.js: the first line is on screen (two frames after it), once per load.
         if let body = message.body as? [String: Any], (body["painted"] as? Bool) == true {
-            log("page painted on display \(display)")
-            if let design = target.design { painted = (design, Date()) }
-            fadeOverlay(display, why: "page painted")
+            // Only from the page being shown: a {painted} still on its way from the page a switch
+            // replaced must not lift the cover or label a picture.
+            if let from = message.frameInfo.request.url, from.isFileURL, canonicalPath(from) != canonicalPath(target.index) {
+                return log("page painted on display \(display): ignored, from \(from.path), not \(target.label)")
+            }
+            guard let load = loading[display] else { return }
+            drawn[display] = load
+            log("page painted on display \(display): \(load.look)")
+            if running {
+                drawnSinceRun.insert(display)
+                fadeOverlay(display, why: "page painted")
+                snapshotIfDue(display, reason: "page painted")
+            } else if unseen[display] != nil {
+                unseenDrawn(display)  // the cover stays until the return
+            } else {
+                fadeOverlay(display, why: "page painted")
+            }
             return
         }
         guard acknowledged == 1 || acknowledged % 10 == 0 else { return }
@@ -581,28 +849,31 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             log("page: sent the latest state on load, \(Self.age(latest.t)), with \(replay.held)")
             Self.send(latest.line, to: webView) { [weak self] error in self?.scriptFailed(error) }
         }
-        readBackground(display, webView)
+        if let look = loading[display]?.look { readBackground(display, webView, look: look) }
         scheduleDesktopAfterLoad(display)
     }
 
     // The window shows its background wherever the page has not drawn (before its first paint,
-    // during a WebContent restart): the page's own colour, not black.
-    private func readBackground(_ display: CGDirectDisplayID, _ webView: WKWebView) {
+    // during a WebContent restart): the page's own colour, not black. Kept per look
+    // (DesignBackgrounds) for the window and the solid picture of a look with no picture yet.
+    private func readBackground(_ display: CGDirectDisplayID, _ webView: WKWebView, look: Look) {
         let script = """
             const css = (e) => e ? getComputedStyle(e).backgroundColor : "";
             return [css(document.body), css(document.documentElement)];
             """
         webView.callAsyncJavaScript(script, arguments: [:], in: nil, in: .page) { [weak self] result in
             guard let self, case .success(let value) = result, let colours = value as? [String] else { return }
-            guard let colour = colours.lazy.compactMap(Self.opaqueColour).first,
-                  let window = self.windows[display], window.backgroundColor != colour else { return }
+            guard let css = colours.first(where: { Self.opaqueColour($0) != nil }), let colour = Self.opaqueColour(css),
+                  self.currentLook == look else { return }
+            DesignBackgrounds.learn(css, for: look)
+            guard let window = self.windows[display], window.backgroundColor != colour else { return }
             window.backgroundColor = colour
-            log("window background on display \(display): \(colours.first { Self.opaqueColour($0) != nil } ?? "?") from the page")
+            log("window background on display \(display): \(css) from the page (\(look))")
         }
     }
 
     // "rgb(11, 17, 32)" or "rgba(r, g, b, a)" with a > 0.
-    private static func opaqueColour(_ css: String) -> NSColor? {
+    static func opaqueColour(_ css: String) -> NSColor? {
         guard let open = css.firstIndex(of: "("), let close = css.lastIndex(of: ")") else { return nil }
         let parts = css[css.index(after: open)..<close].split(separator: ",").compactMap {
             Double($0.trimmingCharacters(in: .whitespaces))
@@ -614,15 +885,21 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     // MARK: Overlay over a reloading or returning page
 
     // Every picture is checked before it is shown: its luma over a 48x30 grid, logged, and refused
-    // when it is a uniform field (a blank page). A populated page has a std of ~20 (glass).
+    // when it is a uniform field (a blank page), unless it is meant to be one (showSolid). A
+    // populated page has a std of ~20 (glass). Every use is logged with the look it shows.
     @discardableResult
-    private func showOverlay(_ display: CGDirectDisplayID, _ image: NSImage, from source: String) -> Bool {
+    private func showOverlay(_ display: CGDirectDisplayID, _ image: NSImage, look: Look?, from source: String,
+                             solid: Bool = false) -> Bool {
         guard let container = windows[display]?.contentView else { return false }
-        let stats = Self.lumaStats(image)
-        let described = stats.map { String(format: "luma mean %.1f std %.1f", $0.mean, $0.std) } ?? "luma unknown"
-        guard let stats, stats.std >= Self.blankLumaStd else {
-            log("overlay: display \(display) refused \(source): blank (\(described))")
-            return false
+        let what = look.map { "design \($0.design), appearance \($0.appearance)" } ?? "look unknown"
+        var described = "a solid"
+        if !solid {
+            let stats = image.cgImage(forProposedRect: nil, context: nil, hints: nil).flatMap(DesktopMatcher.lumaStats)
+            described = stats.map { String(format: "luma mean %.1f std %.1f", $0.mean, $0.std) } ?? "luma unknown"
+            guard let stats, stats.std >= DesktopMatcher.blankLumaStd else {
+                log("overlay: display \(display) refused \(source) (\(what)): blank (\(described))")
+                return false
+            }
         }
         let view = overlays[display]?.view ?? NSImageView(frame: container.bounds)
         view.image = image
@@ -631,58 +908,62 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         view.wantsLayer = true
         view.alphaValue = 1
         if view.superview == nil { container.addSubview(view, positioned: .above, relativeTo: nil) }
-        overlays[display] = (view, Date())
+        overlays[display] = (view, Date(), look)
         armOverlayTimeout(display)
-        log("overlay: display \(display) shows \(source), \(described), until the page paints")
+        log("overlay: display \(display) shows \(what): \(source), \(described), until the page paints")
         return true
     }
 
-    // The newest snapshot of the running page (written by DesktopMatcher, see snapshotIfDue).
+    // The newest snapshot of the look the page is to show (written by DesktopMatcher, see
+    // snapshotIfDue); never one of another design or appearance.
     @discardableResult
-    private func showNewestPicture(_ display: CGDirectDisplayID, why: String) -> Bool {
-        guard let url = DesktopMatcher.newestPicture(display), let image = NSImage(contentsOf: url) else {
-            log("overlay: display \(display) has no picture to show (\(why))")
+    private func showCurrentPicture(_ display: CGDirectDisplayID, why: String) -> Bool {
+        let look = currentLook
+        guard let picture = DesktopMatcher.newestPicture(display, of: look), let image = NSImage(contentsOf: picture.url) else {
+            log("overlay: display \(display) has no picture of \(look) to show (\(why))")
             return false
         }
-        let age = ((try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate)
-            .map { String(format: ", %.0f s old", Date().timeIntervalSince($0)) } ?? ""
-        return showOverlay(display, image, from: "\(url.lastPathComponent)\(age) (\(why))")
+        let age = Double(Int(Date().timeIntervalSince1970 * 1000) - picture.ms) / 1000
+        return showOverlay(display, image, look: look, from: String(format: "%@, %.0f s old (%@)", picture.url.lastPathComponent, age, why))
     }
 
-    // After resume(): the page's first two frames, then the overlay goes. A page held by a cover
-    // has posted {painted} long ago, so the host waits on the frames itself.
-    private func liftOverlaysAfterFirstFrame() {
-        for (display, webView) in webViews where overlays[display] != nil {
-            webView.callAsyncJavaScript(
-                "await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))",
-                arguments: [:], in: nil, in: .page
-            ) { [weak self] result in
-                guard let self, self.webViews[display] === webView, self.running else { return }
-                if case .failure(let error) = result { return self.scriptFailed(error) }
-                // A page still loading has its own {painted} to wait for.
-                if !webView.isLoading { self.fadeOverlay(display, why: "first frame after resume") }
-            }
-        }
-    }
-
-    private static func lumaStats(_ image: NSImage) -> (mean: Double, std: Double)? {
-        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
-        let width = 48, height = 30
-        var pixels = [UInt8](repeating: 0, count: width * height)
-        let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
-            guard let context = CGContext(
-                data: buffer.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width,
-                space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)
-            else { return false }
-            context.interpolationQuality = .medium
-            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+    // No picture of the look yet: a plain field of its background colour over a page that still
+    // shows an older look.
+    private func showSolid(_ display: CGDirectDisplayID, why: String) {
+        let look = currentLook
+        let background = DesignBackgrounds.colour(for: look)
+        let image = NSImage(size: NSSize(width: 8, height: 8), flipped: false) { rect in
+            background.colour.setFill()
+            rect.fill()
             return true
         }
-        guard drawn else { return nil }
-        let count = Double(pixels.count)
-        let mean = pixels.reduce(0.0) { $0 + Double($1) } / count
-        let variance = pixels.reduce(0.0) { $0 + (Double($1) - mean) * (Double($1) - mean) } / count
-        return (mean, variance.squareRoot())
+        showOverlay(display, image, look: look, from: "its background, \(background.source) (\(why))", solid: true)
+    }
+
+    // The window's cover until the page has drawn the current look.
+    private func coverWithCurrentLook(_ display: CGDirectDisplayID, why: String) {
+        if let overlay = overlays[display], overlay.look == currentLook { return armOverlayTimeout(display) }
+        if !showCurrentPicture(display, why: why) { showSolid(display, why: why) }
+    }
+
+    // After resume(): the page's first two frames. Then the overlay goes (a page held by a cover
+    // has posted {painted} long ago, so the host waits on the frames itself), an appearance set
+    // while hidden is drawn, and a fresh snapshot still due is taken.
+    private func afterResume() {
+        for (display, webView) in webViews {
+            afterFrames(webView, display) { [weak self] in
+                guard let self, self.running else { return }
+                // A page still loading has its own {painted} to wait for.
+                guard !webView.isLoading, (self.drawn[display]?.gen ?? -1) >= (self.loading[display]?.gen ?? 0) else { return }
+                self.drawnSinceRun.insert(display)
+                self.fadeOverlay(display, why: "first frame after resume")
+                if let want = self.wanted[display], self.drawn[display]?.gen != want.gen {
+                    self.settleThenDrawn(display, webView, gen: want.gen)
+                } else {
+                    self.snapshotIfDue(display, reason: "first frames after resume")
+                }
+            }
+        }
     }
 
     private func fadeOverlay(_ display: CGDirectDisplayID, why: String) {
@@ -723,15 +1004,18 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
     // MARK: Snapshots: the desktop picture and the overlay (Desktop.swift)
 
-    // A page is snapshotted only while the wallpaper runs (on screen and drawing): a covered or
-    // paused web view may hold nothing current, and an overlay made from one was blank and held
-    // for 639 s (2026-11-05). The newest file per display is both the macOS desktop picture (when
-    // matching is on; it is written either way) and the overlay over a page that reloads unplanned,
-    // reloads on return from a cover, or returns from a long cover.
-    // When: 8 s after a page load (once running, if it loaded under a cover), when matching is
-    // switched on, and otherwise (Space changes, the running page) at most every snapshotEvery and
-    // only if the page was sent a line since the last one. Each costs ~100-220 ms of async
-    // capture, 3-6 ms of WebContent CPU and a ~1 MB JPEG written off the main thread.
+    // A page is snapshotted only while it is drawing: running (on screen), or drawing a new look
+    // unseen; a covered or paused web view may hold nothing current, and an overlay made from one
+    // was blank and held for 639 s (2026-11-05). And only while it shows the look it is meant to
+    // (pageShowsCurrent), so each file is tagged with what it shows. The newest file of the current
+    // look is both the macOS desktop picture (when matching is on; it is written either way) and
+    // the overlay over a page that reloads unplanned, reloads on return from a cover, or returns
+    // from a long cover.
+    // When: as soon as a new design or appearance has drawn (freshDue, once, past the throttle);
+    // 8 s after a page load (once running, if it loaded under a cover); when matching is switched
+    // on; and otherwise (Space changes, the running page) at most every snapshotEvery and only if
+    // the page was sent a line since the last one. Each costs ~100-220 ms of async capture, 3-6 ms
+    // of WebContent CPU and a ~1 MB JPEG written off the main thread.
     private func scheduleDesktopAfterLoad(_ display: CGDirectDisplayID) {
         desktopAfterLoadWork[display]?.cancel()
         let work = DispatchWorkItem { [weak self] in
@@ -746,21 +1030,26 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.desktopAfterLoad, execute: work)
     }
 
+    // A new look (freshDue) is snapshotted as soon as it has drawn on screen, past the throttle and
+    // the settle, once: Ayush's return to the desktop must find the desktop picture of it.
     private func snapshotIfDue(_ display: CGDirectDisplayID, reason: String, force: Bool = false) {
-        // Running (so shown and uncovered) for a moment: the page has painted since it resumed.
-        guard running, Date().timeIntervalSince(runningSince) >= Self.snapshotSettle,
-              windows[display]?.occlusionState.contains(.visible) == true else { return }
+        // Shown, running, and the page showing the look it is meant to (not mid-switch).
+        guard running, isShown(display), pageShowsCurrent(display) else { return }
+        let fresh = freshDue.contains(display) && drawnSinceRun.contains(display)
+        // Otherwise running for a moment: the page has painted since it resumed.
+        guard fresh || Date().timeIntervalSince(runningSince) >= Self.snapshotSettle else { return }
         let now = Date()
         let due = snapshotDue.contains(display)
-        if !force, !due {
+        if !force, !due, !fresh {
             guard sentSinceSnapshot.contains(display),
                   now.timeIntervalSince(lastSnapshot[display] ?? .distantPast) >= Self.snapshotEvery
             else { return }
         }
+        freshDue.remove(display)
         snapshotDue.remove(display)
         sentSinceSnapshot.remove(display)
         lastSnapshot[display] = now
-        desktop.update(display, reason: due && !force ? "page loaded" : reason)
+        requestSnapshot(display, reason: fresh ? "new look, \(reason)" : due && !force ? "page loaded" : reason)
     }
 
     private func snapshotEverywhere(reason: String, force: Bool = false) {
@@ -779,10 +1068,9 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     // (Desktop.swift), if matching has made one, covers the reload instead.
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         log("WebContent process ended; reloading the page")
-        if let display = webViews.first(where: { $0.value === webView })?.key, overlays[display] == nil {
-            showNewestPicture(display, why: "WebContent restart")
-        }
-        load(webView)
+        guard let display = webViews.first(where: { $0.value === webView })?.key else { return }
+        if overlays[display] == nil { showCurrentPicture(display, why: "WebContent restart") }
+        load(display, webView)
     }
 
     // Private WebKit property, read only for the log line (cost measurement needs the pid).
@@ -807,6 +1095,12 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             desktopAfterLoadWork.removeValue(forKey: display)?.cancel()
             overlays[display] = nil
             overlayTimeouts.removeValue(forKey: display)?.cancel()
+            unseen.removeValue(forKey: display)?.cancel()
+            loading[display] = nil
+            wanted[display] = nil
+            drawn[display] = nil
+            freshDue.remove(display)
+            drawnSinceRun.remove(display)
             log("display \(display) gone: \(windows.count) window(s)")
         }
         for (display, screen) in screens {
@@ -832,8 +1126,15 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         window.ignoresMouseEvents = true
         window.canHide = false
         window.isOpaque = true
-        window.backgroundColor = Self.defaultBackground
+        // Until the page reports its own: what it reported last time, or a neutral.
+        window.backgroundColor = DesignBackgrounds.colour(for: currentLook).colour
         window.hasShadow = false
+        if testInstance {
+            // Never seen: transparent and below the desktop, as Headless's window, which the window
+            // server reports occluded: a forced cover then throttles WebKit as a real one does.
+            window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) - 1)
+            window.alphaValue = 0
+        }
         window.isReleasedWhenClosed = false
         window.animationBehavior = .none
 
@@ -850,9 +1151,13 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
         windows[display] = window
         webViews[display] = webView
-        // At launch the page has no data until the feed's first line: the last snapshot covers it.
-        showNewestPicture(display, why: "launch")
-        load(webView)
+        applyOcclusionDetection(display)
+        // At launch the page has no data until the feed's first line: the last snapshot of its
+        // look covers it (none: the window's colour). Quit put the user's own picture back, so
+        // the first paint while running sets the desktop picture at once (freshDue).
+        showCurrentPicture(display, why: "launch")
+        freshDue.insert(display)
+        load(display, webView)
         NotificationCenter.default.addObserver(
             self, selector: #selector(occlusionChanged),
             name: NSWindow.didChangeOcclusionStateNotification, object: window)
@@ -992,6 +1297,12 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             onSignal(SIGUSR2) { app in
                 app.forcedCover = !(app.forcedCover ?? false)
                 log("test: forced \(app.forcedCover! ? "covered" : "uncovered")")
+                for display in app.webViews.keys { app.applyOcclusionDetection(display) }
+                // What a real cover sends: WebKit re-reads its view's visibility on this
+                // notification, not when its occlusion check is switched.
+                for window in app.windows.values {
+                    NotificationCenter.default.post(name: NSWindow.didChangeOcclusionStateNotification, object: window)
+                }
                 app.evaluateCoverage()
             }
         }
@@ -1027,10 +1338,20 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         let menu = KilnMenu(min: Settings.minPeriod, max: Settings.maxPeriod, step: Settings.step) { [unowned self] in
             self.menuState()
         }
-        menu.willOpen = { [unowned self] in self.refreshDesignPicture() }
+        menu.willOpen = { [unowned self] in self.refreshDesignPictures() }
         menu.setPeriod = { [unowned self] in self.setPeriod($0, source: "menu") }
         menu.stepPeriod = { [unowned self] in self.stepPeriod($0, source: "menu") }
         menu.chooseDesign = { [unowned self] in self.chooseDesign($0) }
+        menu.setAppearance = { [unowned self] appearance in
+            var next = self.settings
+            next.appearance = appearance
+            self.choose(next, source: "menu")
+        }
+        menu.setTempUnit = { [unowned self] unit in
+            var next = self.settings
+            next.tempUnit = unit
+            self.choose(next, source: "menu")
+        }
         menu.setMatchDesktop = { [unowned self] in self.setMatchDesktop($0) }
         menu.setLaunchAtLogin = { [unowned self] in self.setLaunchAtLogin($0) }
         menu.togglePause = { [unowned self] in self.togglePause() }
@@ -1060,18 +1381,23 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             hidden: reasons.contains(.hidden),
             pausedByYou: reasons.contains(.manual),
             matchDesktop: settings.matchDesktop,
-            launchAtLogin: SMAppService.mainApp.status == .enabled)
+            launchAtLogin: SMAppService.mainApp.status == .enabled,
+            appearance: settings.appearance,
+            tempUnit: settings.tempUnit)
     }
 
-    // The shown design's picture in the grid, from the main display's newest desktop snapshot,
-    // when that was taken after the design last painted (so it is of this design, drawn).
-    private func refreshDesignPicture() {
-        guard let painted, painted.design == target.design, let screen = NSScreen.screens.first,
-              let snapshot = DesktopMatcher.newestPicture(Self.displayID(screen)),
-              let taken = DesignPictures.modified(snapshot), taken > painted.at
-        else { return }
-        if DesignPictures.refresh(painted.design, from: snapshot) {
-            log("menu: picture of design \(painted.design) from \(snapshot.lastPathComponent)")
+    // The grid's pictures, each from the main display's newest desktop snapshot of that design.
+    // The design is read from the snapshot's own tag (Desktop.swift), set when it was taken and
+    // checked against the page when it completed, never inferred from timing: before, a picture
+    // was "of the shown design" when newer than its last paint, so a snapshot of the old design
+    // still being written across a switch, or a {painted} from the page a switch replaced, filed
+    // the old design's picture under the new one.
+    private func refreshDesignPictures() {
+        guard let screen = NSScreen.screens.first else { return }
+        for (design, picture) in DesktopMatcher.newestByDesign(Self.displayID(screen)) where Designs.isValidID(design) {
+            if DesignPictures.refresh(design, from: picture.url) {
+                log("menu: picture of design \(design) from \(picture.url.lastPathComponent)")
+            }
         }
     }
 

@@ -4,24 +4,58 @@
 import Darwin
 import Foundation
 
+// A test instance of the wallpaper (KILNWALL_TEST_HOME=<folder>, see main.swift's test hooks)
+// keeps its settings.json in <folder>/config and its pictures in <folder>/support, so it never
+// reads or writes the live instance's choices, desktop snapshots or design pictures.
+enum TestHome {
+    static let url: URL? = ProcessInfo.processInfo.environment["KILNWALL_TEST_HOME"]
+        .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL }
+}
+
+// ~/Library/Application Support/KilnWall: the desktop snapshots (Desktop.swift), the design
+// pictures and the designs' background colours (Menu.swift).
+enum KilnSupport {
+    static let folder: URL = TestHome.url?.appendingPathComponent("support", isDirectory: true)
+        ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("KilnWall", isDirectory: true)
+}
+
+// The look a design is told to take: "auto" is the design's own day/night rule (the sun);
+// "light" and "dark" force its day or night look (kiln-runtime.js, Kiln.appearance).
+enum Appearance: String, CaseIterable {
+    case auto, light, dark
+}
+
+// How the page prints temperatures; the feed is always Celsius (kiln-runtime.js, Kiln.tempUnit).
+enum TempUnit: String, CaseIterable {
+    case fahrenheit = "F"
+    case celsius = "C"
+}
+
 // ~/.config/kiln-wall/settings.json: {"design": "<folder id>", "period_ms": <100..1000>,
-// "match_desktop": <bool, default true>}, plus "original_desktop" (see OriginalDesktop), which is
+// "match_desktop": <bool, default true>, "appearance": "auto" | "light" | "dark" (default auto),
+// "temp_unit": "F" | "C" (default F)}, plus "original_desktop" (see OriginalDesktop), which is
 // state the app keeps, not a choice. Every writer (this app, the kiln-wall CLI) writes it
 // atomically, temp file + rename, and keeps the keys it does not know.
 struct Settings: Equatable {
     static let minPeriod = 100
     static let maxPeriod = 1000
     static let step = 100
-    static let defaults = Settings(design: "glass", periodMs: 300, matchDesktop: true)
+    static let defaults = Settings(design: "glass", periodMs: 300, matchDesktop: true, appearance: .auto, tempUnit: .fahrenheit)
 
-    static let folder = FileManager.default.homeDirectoryForCurrentUser
+    // ~/.config/kiln-wall: the designs and the old page folder live here in every instance.
+    static let home = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/kiln-wall", isDirectory: true)
+    // Where settings.json is: home, or a test instance's own folder.
+    static let folder = TestHome.url?.appendingPathComponent("config", isDirectory: true) ?? home
     static let file = folder.appendingPathComponent("settings.json")
 
     var design: String
     var periodMs: Int
     // Keep the macOS desktop picture matched to the wallpaper (DesktopMatcher, Desktop.swift).
     var matchDesktop: Bool
+    var appearance: Appearance
+    var tempUnit: TempUnit
 
     static func clamp(_ ms: Int) -> Int { min(maxPeriod, max(minPeriod, ms)) }
 
@@ -72,10 +106,34 @@ struct Settings: Equatable {
         } else {
             result.matchDesktop = defaults.matchDesktop
         }
+        // Optional too. Read case-insensitively ("Dark", "c"), as the runtime does.
+        if let value = object["appearance"] {
+            if let text = value as? String, let appearance = Appearance(rawValue: text.lowercased()) {
+                result.appearance = appearance
+            } else {
+                problems.append("appearance \(value) is not auto, light or dark")
+            }
+        } else {
+            result.appearance = defaults.appearance
+        }
+        if let value = object["temp_unit"] {
+            if let text = value as? String, let unit = TempUnit(rawValue: text.uppercased()) {
+                result.tempUnit = unit
+            } else {
+                problems.append("temp_unit \(value) is not F or C")
+            }
+        } else {
+            result.tempUnit = defaults.tempUnit
+        }
         if !problems.isEmpty {
-            log("settings: \(problems.joined(separator: "; ")); using design \(result.design), period \(result.periodMs) ms, match desktop \(result.matchDesktop)")
+            log("settings: \(problems.joined(separator: "; ")); using \(result.summary)")
         }
         return result
+    }
+
+    // For the logs: "design glass, period 300 ms, match desktop true, appearance auto, °F".
+    var summary: String {
+        "design \(design), period \(periodMs) ms, match desktop \(matchDesktop), appearance \(appearance.rawValue), °\(tempUnit.rawValue)"
     }
 
     func write() throws {
@@ -83,6 +141,8 @@ struct Settings: Equatable {
             object["design"] = design
             object["period_ms"] = periodMs
             object["match_desktop"] = matchDesktop
+            object["appearance"] = appearance.rawValue
+            object["temp_unit"] = tempUnit.rawValue
         }
     }
 
@@ -180,7 +240,7 @@ enum Designs {
         if let path = ProcessInfo.processInfo.environment["KILN_DESIGNS_DIR"], !path.isEmpty {
             return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
         }
-        return Settings.folder.appendingPathComponent("designs", isDirectory: true)
+        return Settings.home.appendingPathComponent("designs", isDirectory: true)
     }
 
     static func isValidID(_ id: String) -> Bool {
@@ -221,7 +281,7 @@ struct PageTarget: Equatable {
     let design: String?  // nil: the old single page folder or the bundled page
     let label: String
 
-    static let userPageFolder = Settings.folder.appendingPathComponent("page", isDirectory: true)
+    static let userPageFolder = Settings.home.appendingPathComponent("page", isDirectory: true)
 
     static func design(_ id: String, in root: URL = Designs.root) -> PageTarget {
         PageTarget(index: Designs.index(of: id, in: root), readAccess: root, design: id, label: "design \(id)")

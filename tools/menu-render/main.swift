@@ -1,8 +1,9 @@
 // Renders the menu-bar menu offscreen, light and dark, at 2x, without opening it: for checking
 // it to the pixel without touching the screen. Not part of the app.
 //
-//   xcrun swiftc -O -target arm64-apple-macos26.0 Sources/Menu.swift tools/menu-render/main.swift -o /tmp/menu-render
-//   /tmp/menu-render <out-dir> [--hover <design-id>]
+//   xcrun swiftc -O -target arm64-apple-macos26.0 Sources/Menu.swift Sources/Settings.swift tools/menu-render/main.swift -o /tmp/menu-render
+//   /tmp/menu-render <out-dir> [--hover <design-id>] [--light running|covered|paused]
+//                    [--appearance auto|light|dark] [--temp-unit F|C]
 //
 // The custom rows are Menu.swift's own views, built by KilnMenu exactly as the app builds them.
 // The native rows are AppKit's own menu item views, taken from the menu's implementation
@@ -14,6 +15,9 @@ import AppKit
 import ObjectiveC
 
 typealias MakeView = @convention(c) (AnyObject, Selector, Int, AnyObject?) -> Unmanaged<NSView>?
+
+// Settings.swift logs through main.swift's log in the app.
+func log(_ message: String) { print(message) }
 
 func designs(_ root: URL) -> [MenuState.DesignEntry] {
     let names = ((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []).filter { !$0.hasPrefix("_") && !$0.hasPrefix(".") }
@@ -50,7 +54,9 @@ MainActor.assumeIsolated {
         feedText: light == .covered ? "Feed: kiln-feed.py (pid 95261), held at 1000 ms" : "Feed: kiln-feed.py (pid 95261)",
         designName: "The Ledger", periodMs: 300, designs: designs(root), currentDesign: "ledger",
         designsFolder: "~/.config/kiln-wall/designs", hidden: false, pausedByYou: light == .paused,
-        matchDesktop: true, launchAtLogin: false)
+        matchDesktop: true, launchAtLogin: false,
+        appearance: option("--appearance").flatMap(Appearance.init(rawValue:)) ?? .auto,
+        tempUnit: option("--temp-unit").flatMap(TempUnit.init(rawValue:)) ?? .fahrenheit)
     let kiln = KilnMenu(min: 100, max: 1000, step: 100) { state }
     kiln.menuNeedsUpdate(kiln.menu)
     let menu = kiln.menu
@@ -69,6 +75,24 @@ MainActor.assumeIsolated {
         } else if let view = make(impl, makeSel, i, nil)?.takeUnretainedValue() {
             rows.append((view, item.isSeparatorItem ? 11 : 24))
         }
+    }
+    // A native row with a subtitle is taller than 24 and its made view has no size to say by how
+    // much: it gets what menu.size has beyond the rest (AppKit's own sum), shared if several.
+    let subtitled = menu.items.enumerated().filter { $0.element.view == nil && !($0.element.subtitle ?? "").isEmpty }.map(\.offset)
+    if !subtitled.isEmpty {
+        let extra = (menu.size.height - rows.reduce(10) { $0 + $1.1 }) / CGFloat(subtitled.count)
+        var row = 0
+        for (i, item) in menu.items.enumerated() {
+            if subtitled.contains(i) {
+                rows[row].1 += extra
+                print("native row '\(item.title)' with a subtitle: \(rows[row].1) pt (from menu.size)")
+            }
+            row += 1
+        }
+    }
+    for (view, h) in rows { print("row \(type(of: view)) \(h) pt") }
+    for case let control as NSSegmentedControl in rows.flatMap({ [$0.0] + $0.0.allSubviews }) {
+        print("segmented control \(control.frame) (fitting \(control.fittingSize), control size \(control.controlSize.rawValue))")
     }
     let height = rows.reduce(10) { $0 + $1.1 }
     print("stacked height \(height) (menu.size says \(menu.size.height))")
@@ -130,7 +154,9 @@ MainActor.assumeIsolated {
         for view in backdrop.allSubviews { view.needsDisplay = true }
         let rep = backdrop.bitmapImageRepForCachingDisplay(in: backdrop.bounds)!
         backdrop.cacheDisplay(in: backdrop.bounds, to: rep)
-        let file = out.appendingPathComponent("menu-\(name)\(option("--light").map { "-" + $0 } ?? "")\(option("--hover").map { "-hover-" + $0 } ?? "")@2x.png")
+        let variant = ["--light", "--appearance", "--temp-unit"].compactMap { option($0).map { "-" + $0 } }.joined()
+            + (option("--hover").map { "-hover-" + $0 } ?? "")
+        let file = out.appendingPathComponent("menu-\(name)\(variant)@2x.png")
         try! rep.representation(using: .png, properties: [:])!.write(to: file)
         print("wrote \(file.path) (\(rep.pixelsWide)x\(rep.pixelsHigh))")
     }

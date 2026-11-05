@@ -3,8 +3,9 @@
 // its output:
 //
 //   KilnWall --snapshot out.png [--after 8] [--frames 3 --every 1] [--size 1512x982] [--scale 2]
-//            [--design glass] [--period-ms 300] [--fixture lines.jsonl]
-//   KilnWall --measure 20 [--size 1512x982] [--design glass] [--period-ms 300] [--fixture lines.jsonl]
+//            [--design glass] [--period-ms 300] [--appearance dark] [--temp-unit C] [--fixture lines.jsonl]
+//   KilnWall --measure 20 [--size 1512x982] [--design glass] [--period-ms 300] [--appearance dark]
+//            [--temp-unit C] [--fixture lines.jsonl]
 //
 // No menu-bar item, no wallpaper windows, no page-folder or settings watcher, no hotkeys and no
 // instance check, so a running KilnWall is left alone; settings.json is read, never written. The
@@ -25,9 +26,9 @@ struct HeadlessOptions {
         usage: KilnWall                (no arguments: the wallpaper; launch it with `open`)
                KilnWall --snapshot <out.png> [--after <s>] [--frames <n> --every <s>]
                         [--size <WxH>] [--scale 1|2] [--design <id>] [--period-ms <ms>]
-                        [--fixture <file.jsonl>]
+                        [--appearance auto|light|dark] [--temp-unit F|C] [--fixture <file.jsonl>]
                KilnWall --measure <s> [--size <WxH>] [--design <id>] [--period-ms <ms>]
-                        [--fixture <file.jsonl>]
+                        [--appearance auto|light|dark] [--temp-unit F|C] [--fixture <file.jsonl>]
 
           --snapshot  write a PNG of the page --after seconds (default 8) after it loads; with
                       --frames n, write <out>-01.png ... <out>-n.png, --every seconds apart (default 1)
@@ -38,6 +39,8 @@ struct HeadlessOptions {
                       ~/.config/kiln-wall/designs); default: settings.json's, with the wallpaper's
                       fallbacks
           --period-ms the live feed's period, 100 to 1000 ms (default: settings.json's)
+          --appearance auto (the design's sun rule), light or dark (default: settings.json's)
+          --temp-unit F or C, how the page prints temperatures (default: settings.json's)
           --fixture   replay this file's JSON lines at 1 Hz, looping, instead of kiln-feed.py
           -h, --help  print this and exit
         """
@@ -52,6 +55,8 @@ struct HeadlessOptions {
     var fixture: String?
     var design: String?
     var periodMs: Int?
+    var appearance: Appearance?
+    var tempUnit: TempUnit?
 
     // nil: not a headless run (the wallpaper).
     static func parse(_ arguments: [String]) throws -> HeadlessOptions? {
@@ -114,6 +119,18 @@ struct HeadlessOptions {
                     throw UsageError(description: "--period-ms: a whole number of ms, \(Settings.minPeriod) to \(Settings.maxPeriod)")
                 }
                 options.periodMs = Int(n)
+            case "--appearance":
+                let text = try value(flag)
+                guard let appearance = Appearance(rawValue: text.lowercased()) else {
+                    throw UsageError(description: "--appearance \(text): auto, light or dark")
+                }
+                options.appearance = appearance
+            case "--temp-unit":
+                let text = try value(flag)
+                guard let unit = TempUnit(rawValue: text.uppercased()) else {
+                    throw UsageError(description: "--temp-unit \(text): F or C")
+                }
+                options.tempUnit = unit
             default: throw UsageError(description: "unknown argument \(flag)")
             }
             i += 1
@@ -163,6 +180,8 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
     private let settings = Settings.load()
     private lazy var target = options.design.map { PageTarget.design($0) } ?? PageTarget.resolve(settings.design)
     private lazy var periodMs = options.periodMs ?? settings.periodMs
+    private lazy var appearance = options.appearance ?? settings.appearance
+    private lazy var tempUnit = options.tempUnit ?? settings.tempUnit
     private var replay = ReplayCache()
     private var window: NSWindow?
     private var webView: WKWebView?
@@ -201,7 +220,7 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
         if options.design == nil, target.design != settings.design {
             say("design \(settings.design) (settings.json) has no index.html; showing \(target.label)")
         }
-        say("page \(target.index.path) (\(target.label)) at \(Int(size.width))x\(Int(size.height)) pt, backing scale \(window.backingScaleFactor), period \(periodMs) ms")
+        say("page \(target.index.path) (\(target.label)) at \(Int(size.width))x\(Int(size.height)) pt, backing scale \(window.backingScaleFactor), period \(periodMs) ms, appearance \(appearance.rawValue), °\(tempUnit.rawValue)")
         feed.setPeriod(periodMs)
         KilnWall.loadPage(webView, target)
         after(Self.loadTimeout) { me in
@@ -237,23 +256,19 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
         return window
     }
 
-    // Private WKWebView API (-_setWindowOcclusionDetectionEnabled:, in WebKit since 2017): with it
-    // off, WebKit counts the view visible whenever its window is ordered in.
+    // KilnWall.setOcclusionDetection: with WebKit's occlusion check off, it counts the view visible
+    // whenever its window is ordered in.
     private func keepRenderingWhileUnseen(_ webView: WKWebView) {
-        let setter = NSSelectorFromString("_setWindowOcclusionDetectionEnabled:")
-        guard webView.responds(to: setter) else {
-            return say("warning: this WebKit lacks _setWindowOcclusionDetectionEnabled:; animation may be throttled")
+        if !KilnWall.setOcclusionDetection(webView, false) {
+            say("warning: WebKit occlusion detection could not be turned off; animation may be throttled")
         }
-        typealias SetBool = @convention(c) (AnyObject, Selector, Bool) -> Void
-        unsafeBitCast(webView.method(for: setter), to: SetBool.self)(webView, setter, false)
-        let now = (webView.value(forKey: "_windowOcclusionDetectionEnabled") as? NSNumber)?.boolValue
-        if now != false { say("warning: WebKit occlusion detection is still on; animation may be throttled") }
     }
 
     // MARK: Page and data
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        KilnWall.configure(webView, ["design": target.design ?? settings.design, "period_ms": periodMs]) { [weak self] error in
+        KilnWall.configure(webView, ["design": target.design ?? settings.design, "period_ms": periodMs,
+                                     "appearance": appearance.rawValue, "temp_unit": tempUnit.rawValue]) { [weak self] error in
             self?.say("page config error: \(error.localizedDescription)")
         }
         // The page navigated itself (a reload): as on the wallpaper, it gets the latest state (the

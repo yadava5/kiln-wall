@@ -1,6 +1,7 @@
 // The menu-bar menu. main.swift owns the state and the actions; this builds the menu, keeps it
 // current while it is open, and draws its own rows: the status header on Liquid Glass, the
-// refresh-period slider, the design grid and the two switches. The rest are native items.
+// refresh-period slider, the design grid, the appearance control and the two switches. The rest
+// are native items, the temperature unit's submenu among them.
 //
 // The custom rows line up with the native ones by AppKit's own numbers, measured offscreen from
 // its menu item views on macOS 26.6 (tools/menu-render renders the whole menu that way,
@@ -57,6 +58,8 @@ struct MenuState {
     var pausedByYou: Bool
     var matchDesktop: Bool
     var launchAtLogin: Bool
+    var appearance: Appearance
+    var tempUnit: TempUnit
 }
 
 @MainActor
@@ -69,6 +72,8 @@ final class KilnMenu: NSObject, NSMenuDelegate {
     var setPeriod: (Int) -> Void = { _ in }
     var stepPeriod: (Int) -> Void = { _ in }
     var chooseDesign: (String) -> Void = { _ in }
+    var setAppearance: (Appearance) -> Void = { _ in }
+    var setTempUnit: (TempUnit) -> Void = { _ in }
     var setMatchDesktop: (Bool) -> Void = { _ in }
     // Returns the state it ended in (a failed change keeps the old one).
     var setLaunchAtLogin: (Bool) -> Bool = { $0 }
@@ -82,6 +87,13 @@ final class KilnMenu: NSObject, NSMenuDelegate {
     private let header = StatusHeaderView()
     private let period: PeriodControlView
     private let grid = DesignGridView()
+    private let appearanceRow = AppearanceControlView()
+    // Temperature: a native submenu, the menu's own dropdown (a pop-up button inside a menu
+    // would be a menu tracking inside another), with the unit in use as the row's subtitle.
+    private let tempItem = NSMenuItem()
+    private let unitItems: [TempUnit: NSMenuItem] = Dictionary(uniqueKeysWithValues: TempUnit.allCases.map { unit in
+        (unit, NSMenuItem(title: unit.menuTitle, action: nil, keyEquivalent: ""))
+    })
     private let matchRow = SwitchRowView(title: "Match macOS Wallpaper", symbol: "photo.on.rectangle")
     private let loginRow = SwitchRowView(title: "Launch at Login", symbol: "power")
     private let pauseItem = NSMenuItem()
@@ -105,6 +117,21 @@ final class KilnMenu: NSObject, NSMenuDelegate {
         gridItem.view = grid
         menu.addItem(gridItem)
         menu.addItem(.separator())
+        menu.addItem(.sectionHeader(title: "Appearance"))
+        add(appearanceRow)
+        let units = NSMenu()
+        for unit in TempUnit.allCases {
+            let item = unitItems[unit]!
+            item.action = #selector(unitChosen(_:))
+            item.target = self
+            item.representedObject = unit.rawValue
+            units.addItem(item)
+        }
+        tempItem.title = "Temperature"
+        tempItem.image = NSImage(systemSymbolName: "thermometer.medium", accessibilityDescription: nil)
+        tempItem.submenu = units
+        menu.addItem(tempItem)
+        menu.addItem(.separator())
         configure(pauseItem, "Pause", "pause", #selector(pauseChosen))
         configure(showItem, "Hide Wallpaper", "eye.slash", #selector(showChosen))
         configure(NSMenuItem(), "Reload Page", "arrow.clockwise", #selector(reloadChosen))
@@ -120,6 +147,7 @@ final class KilnMenu: NSObject, NSMenuDelegate {
         period.onChange = { [weak self] in self?.setPeriod($0) }
         period.onStep = { [weak self] in self?.stepPeriod($0) }
         grid.onChoose = { [weak self] in self?.chooseDesign($0) }
+        appearanceRow.onChange = { [weak self] in self?.setAppearance($0) }
         matchRow.onToggle = { [weak self] in self?.setMatchDesktop($0) }
         loginRow.onToggle = { [weak self] on in
             guard let self else { return }
@@ -146,6 +174,9 @@ final class KilnMenu: NSObject, NSMenuDelegate {
     @objc private func showChosen() { toggleShown() }
     @objc private func reloadChosen() { reloadPage() }
     @objc private func folderChosen() { openPageFolder() }
+    @objc private func unitChosen(_ sender: NSMenuItem) {
+        if let unit = (sender.representedObject as? String).flatMap(TempUnit.init(rawValue:)) { setTempUnit(unit) }
+    }
 
     // MARK: Keeping it current
 
@@ -174,6 +205,9 @@ final class KilnMenu: NSObject, NSMenuDelegate {
         header.update(now)
         period.update(periodMs: now.periodMs)
         grid.update(current: now.currentDesign)
+        appearanceRow.update(now.appearance)
+        for (unit, item) in unitItems { item.state = unit == now.tempUnit ? .on : .off }
+        if #available(macOS 14.4, *) { tempItem.subtitle = now.tempUnit.menuTitle }
         matchRow.isOn = now.matchDesktop
         loginRow.isOn = now.launchAtLogin
         pauseItem.title = now.pausedByYou ? "Resume" : "Pause"
@@ -639,6 +673,79 @@ final class DesignTileView: NSView {
     }
 }
 
+// MARK: - Appearance
+
+// Auto (the design's own day/night rule, which follows the sun), Light or Dark: one segmented
+// control across the content columns (16 pt from each edge, like the slider row's buttons), with
+// a line under it saying what the choice does, where the slider row has its key hints. Each
+// choice applies live and the menu stays open, so the wallpaper can be watched changing.
+@MainActor
+final class AppearanceControlView: NSView {
+    var onChange: (Appearance) -> Void = { _ in }
+
+    private static let choices: [(appearance: Appearance, label: String, symbol: String, hint: String)] = [
+        (.auto, "Auto", "circle.lefthalf.filled", "Day look by day, night look after sunset"),
+        (.light, "Light", "sun.max", "The day look, always"),
+        (.dark, "Dark", "moon", "The night look, always"),
+    ]
+    private let control = NSSegmentedControl()
+    private let hint = label(MenuMetrics.smallFont, MenuMetrics.dimText)
+    private var current: Appearance?
+
+    init() {
+        super.init(frame: NSRect(x: 0, y: 0, width: MenuMetrics.width, height: 56))
+        let edge = MenuMetrics.edge, w = MenuMetrics.width
+        control.segmentCount = Self.choices.count
+        control.trackingMode = .selectOne
+        control.segmentDistribution = .fillEqually
+        for (i, choice) in Self.choices.enumerated() {
+            control.setImage(NSImage(systemSymbolName: choice.symbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(MenuMetrics.symbol), forSegment: i)
+            control.setImageScaling(.scaleNone, forSegment: i)
+            control.setLabel(choice.label, forSegment: i)
+            control.setToolTip(choice.hint, forSegment: i)
+        }
+        control.target = self
+        control.action = #selector(chosen)
+        control.setAccessibilityLabel("Appearance")
+        // 24 pt on macOS 26 (measured, tools/menu-render): 4 pt under the section header like the
+        // slider, the hint where the slider row's hints sit, 8 pt between them. Row 56 = 7 x 8.
+        let height = control.fittingSize.height
+        control.frame = NSRect(x: edge, y: 52 - height, width: w - 2 * edge, height: height)
+        hint.frame = NSRect(x: edge - 2, y: 6, width: w - 2 * edge + 4, height: 14)
+        hint.lineBreakMode = .byTruncatingTail
+        addSubview(control)
+        addSubview(hint)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not from a nib") }
+
+    func update(_ appearance: Appearance) {
+        current = appearance
+        guard let i = Self.choices.firstIndex(where: { $0.appearance == appearance }) else { return }
+        if control.selectedSegment != i { control.selectedSegment = i }
+        hint.stringValue = Self.choices[i].hint
+    }
+
+    @objc private func chosen() {
+        guard Self.choices.indices.contains(control.selectedSegment) else { return }
+        let choice = Self.choices[control.selectedSegment]
+        hint.stringValue = choice.hint
+        guard choice.appearance != current else { return }
+        current = choice.appearance
+        onChange(choice.appearance)
+    }
+}
+
+extension TempUnit {
+    var menuTitle: String {
+        switch self {
+        case .fahrenheit: "°F Fahrenheit"
+        case .celsius: "°C Celsius"
+        }
+    }
+}
+
 // MARK: - Switch rows
 
 // A setting as a switch, the way macOS 26's own menu-bar menus show them: symbol and title on
@@ -695,8 +802,7 @@ final class SwitchRowView: NSView {
 // design being shown has its picture refreshed from the newest snapshot of it, so every design
 // that has been on screen has one. Pictures are 336 px wide, twice the widest tile.
 enum DesignPictures {
-    nonisolated static let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("KilnWall/design-pictures", isDirectory: true)
+    nonisolated static let folder = KilnSupport.folder.appendingPathComponent("design-pictures", isDirectory: true)
     nonisolated private static let pixels = 336
     @MainActor private static var cache: [String: (date: Date, image: NSImage)] = [:]
 
