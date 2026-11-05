@@ -53,6 +53,9 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
     private let feed = Feed()
     private var acknowledged = 0
     private var scriptErrors = 0
+    // kiln-feed sends `analytics` only on lines where it changed. A page that loads after that
+    // line (launch race, live reload, WebContent restart) gets this replayed on load.
+    private var lastAnalytics: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         log("started; page folder \(pageFolder.path)")
@@ -164,6 +167,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
     }
 
     private func push(_ json: [String: Any]) {
+        if let analytics = json["analytics"] { lastAnalytics = analytics }
         for webView in webViews.values {
             Self.send(json, to: webView) { [weak self] error in self?.scriptFailed(error) }
         }
@@ -199,6 +203,12 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         let display = webViews.first { $0.value === webView }?.key ?? 0
         log("page loaded on display \(display) (WebContent pid \(Self.webProcessID(webView)))")
         scriptErrors = 0
+        // A partial update: the page merges it with the next full line.
+        if let analytics = lastAnalytics {
+            Self.send(["replay": true, "analytics": analytics], to: webView) { [weak self] error in
+                self?.scriptFailed(error)
+            }
+        }
         if !running {
             webView.callAsyncJavaScript(
                 "window.kiln && window.kiln.pause && window.kiln.pause()", arguments: [:], in: nil, in: .page)
