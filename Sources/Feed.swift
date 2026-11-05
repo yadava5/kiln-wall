@@ -43,18 +43,23 @@ final class Feed {
         launch()
     }
 
-    func stop() {
-        guard wanted else { return }
+    // The running kiln-feed.py's pid, if any (for --measure).
+    var childPID: Int32? { process?.processIdentifier }
+
+    // Returns the child it terminated, so a caller about to exit can wait for it.
+    @discardableResult
+    func stop() -> Process? {
+        guard wanted else { return nil }
         wanted = false
         restartWork?.cancel()
         restartWork = nil
         stopStub()
-        if let process {
-            generation += 1
-            self.process = nil
-            if process.isRunning { process.terminate() }
-            log("feed: stopped kiln-feed.py (pid \(process.processIdentifier))")
-        }
+        guard let process else { return nil }
+        generation += 1
+        self.process = nil
+        if process.isRunning { process.terminate() }
+        log("feed: stopped kiln-feed.py (pid \(process.processIdentifier))")
+        return process
     }
 
     private func launch() {

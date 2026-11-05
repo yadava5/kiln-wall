@@ -103,7 +103,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
 
     // MARK: Page
 
-    private static func resolvePageFolder() -> URL {
+    static func resolvePageFolder() -> URL {
         var isFolder: ObjCBool = false
         if FileManager.default.fileExists(atPath: userPageFolder.path, isDirectory: &isFolder), isFolder.boolValue {
             return userPageFolder
@@ -111,9 +111,34 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         return Bundle.main.resourceURL!.appendingPathComponent("page", isDirectory: true)
     }
 
+    // The next three are shared with the headless modes (Headless.swift), so a snapshot loads and
+    // feeds the page exactly as the wallpaper does.
+    static func makeWebView(size: NSSize, messages: WKScriptMessageHandler) -> WKWebView {
+        let configuration = WKWebViewConfiguration()
+        configuration.userContentController.add(messages, name: "kiln")
+        let webView = WKWebView(frame: NSRect(origin: .zero, size: size), configuration: configuration)
+        webView.autoresizingMask = [.width, .height]
+        // Let the black window show until the page paints, instead of WebKit's white.
+        webView.setValue(false, forKey: "drawsBackground")
+        webView.underPageBackgroundColor = .black
+        return webView
+    }
+
+    static func loadPage(_ webView: WKWebView, from folder: URL) {
+        webView.loadFileURL(folder.appendingPathComponent("index.html"), allowingReadAccessTo: folder)
+    }
+
+    // Data for the page: the parsed JSON object, passed as a real JS object (no string building).
+    static func send(_ json: [String: Any], to webView: WKWebView, onError: @escaping (Error) -> Void) {
+        webView.callAsyncJavaScript(
+            "window.kiln && window.kiln.update(data)", arguments: ["data": json], in: nil, in: .page
+        ) { result in
+            if case .failure(let error) = result { onError(error) }
+        }
+    }
+
     private func load(_ webView: WKWebView) {
-        let index = pageFolder.appendingPathComponent("index.html")
-        webView.loadFileURL(index, allowingReadAccessTo: pageFolder)
+        Self.loadPage(webView, from: pageFolder)
     }
 
     private func watchPageFolder() {
@@ -138,14 +163,9 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         for webView in webViews.values { load(webView) }
     }
 
-    // Data for the page: the parsed JSON object, passed as a real JS object (no string building).
     private func push(_ json: [String: Any]) {
         for webView in webViews.values {
-            webView.callAsyncJavaScript(
-                "window.kiln && window.kiln.update(data)", arguments: ["data": json], in: nil, in: .page
-            ) { [weak self] result in
-                if case .failure(let error) = result { self?.scriptFailed(error) }
-            }
+            Self.send(json, to: webView) { [weak self] error in self?.scriptFailed(error) }
         }
     }
 
@@ -199,7 +219,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
     }
 
     // Private WebKit property, read only for the log line (cost measurement needs the pid).
-    private static func webProcessID(_ webView: WKWebView) -> Int {
+    static func webProcessID(_ webView: WKWebView) -> Int {
         guard webView.responds(to: NSSelectorFromString("_webProcessIdentifier")) else { return 0 }
         return (webView.value(forKey: "_webProcessIdentifier") as? NSNumber)?.intValue ?? 0
     }
@@ -247,13 +267,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         window.isReleasedWhenClosed = false
         window.animationBehavior = .none
 
-        let configuration = WKWebViewConfiguration()
-        configuration.userContentController.add(MessageProxy(self), name: "kiln")
-        let webView = WKWebView(frame: NSRect(origin: .zero, size: screen.frame.size), configuration: configuration)
-        webView.autoresizingMask = [.width, .height]
-        // Let the black window show until the page paints, instead of WebKit's white.
-        webView.setValue(false, forKey: "drawsBackground")
-        webView.underPageBackgroundColor = .black
+        let webView = Self.makeWebView(size: screen.frame.size, messages: MessageProxy(self))
         webView.navigationDelegate = self
         window.contentView = webView
         window.setFrame(screen.frame, display: false)
@@ -540,8 +554,23 @@ final class FolderWatcher {
 
 MainActor.assumeIsolated {
     let app = NSApplication.shared
-    let delegate = KilnWall()
-    app.delegate = delegate
-    app.setActivationPolicy(.accessory)
-    app.run()
+    // `--snapshot` / `--measure`: the headless modes (Headless.swift), nothing of the wallpaper.
+    let headless: HeadlessOptions?
+    do {
+        headless = try HeadlessOptions.parse(CommandLine.arguments)
+    } catch {
+        FileHandle.standardError.write(Data("KilnWall: \(error)\n\n\(HeadlessOptions.usage)\n".utf8))
+        exit(64)
+    }
+    if let headless {
+        let delegate = Headless(headless)
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        app.run()
+    } else {
+        let delegate = KilnWall()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        app.run()
+    }
 }
