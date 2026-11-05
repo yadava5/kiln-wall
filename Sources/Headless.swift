@@ -195,6 +195,9 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
     private var scriptErrors = 0
     private var capturing = -1
     private var finished = false
+    // The Dock on the screen this renders on, read once at start (DockGeometry.swift), as the
+    // wallpaper's page would be told it; NSNull when the Dock is on another display.
+    private var dock: Any = NSNull()
 
     init(_ options: HeadlessOptions) { self.options = options }
 
@@ -209,6 +212,13 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
             options: .userInitiatedAllowingIdleSystemSleep, reason: "KilnWall headless page run")
 
         let size = options.size ?? screen.frame.size
+        let docks = DockWatcher().read()
+        if let info = docks[DockGeometry.displayID(screen)] {
+            dock = info.page
+            say("dock: \(info.description)" + (options.size == nil ? "" : " (for the real \(Int(screen.frame.width))x\(Int(screen.frame.height)) pt screen, not --size)"))
+        } else {
+            say("dock: not on this screen")
+        }
         let window = makeWindow(NSRect(origin: screen.frame.origin, size: size))
         let webView = KilnWall.makeWebView(size: size, messages: self)
         webView.navigationDelegate = self
@@ -268,7 +278,8 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         KilnWall.configure(webView, ["design": target.design ?? settings.design, "period_ms": periodMs,
-                                     "appearance": appearance.rawValue, "temp_unit": tempUnit.rawValue]) { [weak self] error in
+                                     "appearance": appearance.rawValue, "temp_unit": tempUnit.rawValue,
+                                     "dock": dock]) { [weak self] error in
             self?.say("page config error: \(error.localizedDescription)")
         }
         // The page navigated itself (a reload): as on the wallpaper, it gets the latest state (the
@@ -316,6 +327,12 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
     // The page may post to window.webkit.messageHandlers.kiln, as on the wallpaper; printed only
     // under the KILNWALL_TEST_RELOAD_AFTER test hook.
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        // The runtime echoes the Dock it holds (Kiln.dock) when that changes: proof the page has it.
+        if let body = message.body as? [String: Any], let dock = body["dock"] {
+            let text = (try? JSONSerialization.data(withJSONObject: ["dock": dock], options: [.sortedKeys]))
+                .map { String(decoding: $0, as: UTF8.self) } ?? "\(dock)"
+            return say("page has \(text)")
+        }
         guard ProcessInfo.processInfo.environment["KILNWALL_TEST_RELOAD_AFTER"] != nil else { return }
         say("page said \(message.body)")
     }

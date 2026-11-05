@@ -4,8 +4,9 @@
 // video, which sits at the desktop level) and holds a WKWebView showing the chosen design,
 // ~/.config/kiln-wall/designs/<design>/index.html. Each JSON line from the feed (Feed.swift) is
 // handed to the page as its raw text, window.kiln.update(line), and the design, refresh period (100..1000 ms),
-// appearance and temperature unit (settings.json, see Settings.swift) as
-// window.kiln.config({design, period_ms, appearance, temp_unit}). Whenever nobody
+// appearance and temperature unit (settings.json, see Settings.swift), with where the Dock is on
+// that display (DockGeometry.swift), as
+// window.kiln.config({design, period_ms, appearance, temp_unit, dock}). Whenever nobody
 // can see the wallpaper the page is told window.kiln.pause() and the feed is stopped, except
 // under a cover (a window or full-screen Space over the desktop): then the feed runs on for a
 // grace period at 1 s, its lines kept but not sent, so a quick return shows the latest state at
@@ -149,6 +150,8 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     // KILNWALL_TEST_HOME: a test instance (see applicationDidFinishLaunching).
     private let testInstance = TestHome.url != nil
     private let feed = Feed()
+    // The Dock's position and length per display, sent in the page's config (DockGeometry.swift).
+    private let dock = DockWatcher()
     private var acknowledged = 0
     private var scriptErrors = 0
     private var replay = ReplayCache()
@@ -195,9 +198,19 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         watchPageFolder()
         settingsWatcher = SettingsWatcher { [weak self] in self?.settingsFileChanged() }
         watchSystem()
+        dock.onChange = { [weak self] geometry, why in self?.dockChanged(geometry, why: why) }
+        dock.start()
         syncWindows()
         refreshLowPower()
         apply()
+    }
+
+    // The Dock lengthened, shortened or moved: the pages re-lay out from their config (Kiln.onDock).
+    private func dockChanged(_ geometry: [CGDirectDisplayID: DockInfo], why: String) {
+        let text = geometry.isEmpty ? "on no display"
+            : geometry.keys.sorted().map { "display \($0): \(geometry[$0]!.description)" }.joined(separator: "; ")
+        log("dock: \(text) (\(why)); \(webViews.count) page(s) told")
+        configureEverywhere()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -755,10 +768,12 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         }
     }
 
-    // What the page is told: the design it is (the chosen one, or the fallback actually shown).
-    private var pageConfig: [String: Any] {
+    // What the page is told: the design it is (the chosen one, or the fallback actually shown),
+    // and the Dock on its display (null: not on this one).
+    private func pageConfig(_ display: CGDirectDisplayID) -> [String: Any] {
         ["design": target.design ?? settings.design, "period_ms": settings.periodMs,
-         "appearance": settings.appearance.rawValue, "temp_unit": settings.tempUnit.rawValue]
+         "appearance": settings.appearance.rawValue, "temp_unit": settings.tempUnit.rawValue,
+         "dock": dock.current[display]?.page ?? NSNull()]
     }
 
     private func configureEverywhere() {
@@ -766,7 +781,8 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     }
 
     private func configure(_ webView: WKWebView) {
-        Self.configure(webView, pageConfig) { [weak self] error in self?.scriptFailed(error) }
+        let display = webViews.first { $0.value === webView }?.key ?? 0
+        Self.configure(webView, pageConfig(display)) { [weak self] error in self?.scriptFailed(error) }
     }
 
     // MARK: Page
@@ -809,7 +825,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         }
     }
 
-    // {design, period_ms, appearance, temp_unit} for the page: after every load and on every change.
+    // {design, period_ms, appearance, temp_unit, dock} for the page: after every load and on every change.
     static func configure(_ webView: WKWebView, _ config: [String: Any], onError: @escaping (Error) -> Void) {
         webView.callAsyncJavaScript(
             "window.kiln && window.kiln.config && window.kiln.config(c)", arguments: ["c": config], in: nil, in: .page
@@ -1009,6 +1025,12 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
                 fadeOverlay(display, why: "page painted")
             }
             return
+        }
+        // kiln-runtime.js echoes the Dock it now holds (Kiln.dock) whenever that changes.
+        if let body = message.body as? [String: Any], let dock = body["dock"] {
+            let text = (try? JSONSerialization.data(withJSONObject: ["dock": dock], options: [.sortedKeys]))
+                .map { String(decoding: $0, as: UTF8.self) } ?? "\(dock)"
+            return log("page on display \(display) has \(text)")
         }
         guard acknowledged == 1 || acknowledged % 10 == 0 else { return }
         let body = (try? JSONSerialization.data(withJSONObject: message.body))
