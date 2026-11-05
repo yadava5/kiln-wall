@@ -13,7 +13,7 @@
 // The page never shows blank (Ayush, 2026-11-05): a page that (re)loads is sent the latest state
 // as its first line, and a snapshot of the old page is laid over it until it has painted.
 //
-// The period and design change live, from the menu-bar item, the global hotkeys ⌃⌥= (faster,
+// The period and design change live, from the menu-bar item (Menu.swift), the global hotkeys ⌃⌥= (faster,
 // −100 ms) and ⌃⌥- (slower, +100 ms), or the `kiln-wall` CLI, which writes settings.json.
 //
 // The macOS desktop picture is kept matched to the wallpaper (Desktop.swift), because Mission
@@ -40,7 +40,7 @@ enum PauseReason: String, CaseIterable {
 }
 
 @MainActor
-final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigationDelegate {
+final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     // Normal windows covering at least this share of a screen count as covering it. The window
     // server alone reports the gaps between tiled windows and the translucent menu bar as visible.
     private static let coveredShare = 0.97
@@ -96,16 +96,10 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
     private var changedPaths: [String] = []
     private var signals: [DispatchSourceSignal] = []
     private var statusItem: NSStatusItem?
-    private var stateItem: NSMenuItem?
-    private var feedItem: NSMenuItem?
-    private var showItem: NSMenuItem?
-    private var pauseItem: NSMenuItem?
-    private var loginItem: NSMenuItem?
-    private var designMenu: NSMenu?
-    private var designMenuItem: NSMenuItem?
-    private var refreshMenu: NSMenu?
-    private var refreshMenuItem: NSMenuItem?
-    private var matchItem: NSMenuItem?
+    private var menu: KilnMenu?
+    // When the shown design last painted: a desktop snapshot newer than this is a picture of it,
+    // for the menu's design grid (DesignPictures, Menu.swift).
+    private var painted: (design: String, at: Date)?
     private let feed = Feed()
     private var acknowledged = 0
     private var scriptErrors = 0
@@ -206,6 +200,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
             stopHeldFeed()
         }
         statusItem?.button?.appearsDisabled = !running
+        menu?.refresh()
     }
 
     // The covered grace. The feed is told the slow period on its stdin (same pid, same state);
@@ -281,6 +276,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
             }
         }
         configureEverywhere()
+        menu?.refresh()
     }
 
     // A choice made here: apply, then record it in settings.json.
@@ -305,10 +301,15 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         applySettings(read, source: "settings file")
     }
 
-    private func stepPeriod(_ delta: Int, source: String) {
+    // The hotkeys, the menu's slider and its tortoise and hare all set the period here.
+    private func setPeriod(_ ms: Int, source: String) {
         var next = settings
-        next.periodMs = Settings.clamp(settings.periodMs + delta)
+        next.periodMs = Settings.clamp(ms)
         choose(next, source: source)
+    }
+
+    private func stepPeriod(_ delta: Int, source: String) {
+        setPeriod(settings.periodMs + delta, source: source)
     }
 
     // ⌃⌥= faster (−100 ms), ⌃⌥- slower (+100 ms): like btop, "+" is faster.
@@ -506,6 +507,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
                 snapshotIfDue(display, reason: "running")
             }
         }
+        if running { menu?.beat() }
     }
 
     // The latest state (the last line with every held block) as one normal line: the page renders
@@ -532,11 +534,18 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         }
     }
 
-    // A broken page would otherwise log once a second.
+    // A broken page would otherwise log once a second. WebKit's description is only "A JavaScript
+    // exception occurred"; the message, file and line are in the error's userInfo.
     private func scriptFailed(_ error: Error) {
         scriptErrors += 1
         if scriptErrors <= 3 || scriptErrors % 60 == 0 {
-            log("page script error #\(scriptErrors): \(error.localizedDescription)")
+            let info = (error as NSError).userInfo
+            let message = info["WKJavaScriptExceptionMessage"].map { ": \($0)" } ?? ""
+            let file = (info["WKJavaScriptExceptionSourceURL"] as? URL).map {
+                " (\($0.deletingLastPathComponent().lastPathComponent)/\($0.lastPathComponent)"
+                    + (info["WKJavaScriptExceptionLineNumber"].map { " line \($0)" } ?? "") + ")"
+            } ?? ""
+            log("page script error #\(scriptErrors)\(message)\(file) [\(target.label)]")
         }
     }
 
@@ -547,6 +556,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         // kiln-runtime.js: the first line is on screen (two frames after it), once per load.
         if let body = message.body as? [String: Any], (body["painted"] as? Bool) == true {
             log("page painted on display \(display)")
+            if let design = target.design { painted = (design, Date()) }
             fadeOverlay(display, why: "page painted")
             return
         }
@@ -1005,6 +1015,8 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
 
     // MARK: Menu bar
 
+    // The menu itself is Menu.swift; it asks for menuState() when it opens and on every change
+    // while open, and calls back into the same paths as the hotkeys, the CLI and the system.
     private func buildStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let image = NSImage(systemSymbolName: "chart.xyaxis.line", accessibilityDescription: "KilnWall") {
@@ -1012,116 +1024,74 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         } else {
             item.button?.title = "◫"
         }
-        let menu = NSMenu()
-        menu.delegate = self
-        menu.autoenablesItems = false
-        stateItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
-        stateItem?.isEnabled = false
-        feedItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
-        feedItem?.isEnabled = false
-        menu.addItem(.separator())
-        showItem = menu.addItem(withTitle: "Hide Wallpaper", action: #selector(toggleShown), keyEquivalent: "")
-        pauseItem = menu.addItem(withTitle: "Pause", action: #selector(togglePause), keyEquivalent: "")
-        menu.addItem(.separator())
-        designMenu = NSMenu()
-        designMenu?.autoenablesItems = false
-        designMenuItem = menu.addItem(withTitle: "Design", action: nil, keyEquivalent: "")
-        designMenuItem?.submenu = designMenu
-        refreshMenu = NSMenu()
-        refreshMenu?.autoenablesItems = false
-        refreshMenuItem = menu.addItem(withTitle: "Refresh", action: nil, keyEquivalent: "")
-        refreshMenuItem?.submenu = refreshMenu
-        matchItem = menu.addItem(withTitle: "Match macOS Wallpaper", action: #selector(toggleMatchDesktop), keyEquivalent: "")
-        menu.addItem(withTitle: "Reload Page", action: #selector(reloadPage), keyEquivalent: "")
-        menu.addItem(withTitle: "Open Page Folder", action: #selector(openPageFolder), keyEquivalent: "")
-        menu.addItem(.separator())
-        loginItem = menu.addItem(withTitle: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
-        menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit KilnWall", action: #selector(quit), keyEquivalent: "q")
-        for entry in menu.items where entry.action != nil { entry.target = self }
-        item.menu = menu
+        let menu = KilnMenu(min: Settings.minPeriod, max: Settings.maxPeriod, step: Settings.step) { [unowned self] in
+            self.menuState()
+        }
+        menu.willOpen = { [unowned self] in self.refreshDesignPicture() }
+        menu.setPeriod = { [unowned self] in self.setPeriod($0, source: "menu") }
+        menu.stepPeriod = { [unowned self] in self.stepPeriod($0, source: "menu") }
+        menu.chooseDesign = { [unowned self] in self.chooseDesign($0) }
+        menu.setMatchDesktop = { [unowned self] in self.setMatchDesktop($0) }
+        menu.setLaunchAtLogin = { [unowned self] in self.setLaunchAtLogin($0) }
+        menu.togglePause = { [unowned self] in self.togglePause() }
+        menu.toggleShown = { [unowned self] in self.toggleShown() }
+        menu.reloadPage = { [unowned self] in self.reloadPage() }
+        menu.openPageFolder = { [unowned self] in self.openPageFolder() }
+        item.menu = menu.menu
         statusItem = item
+        self.menu = menu
     }
 
-    // The submenus are rebuilt each time the menu opens: designs come and go on disk.
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        stateItem?.title = stateText
-        feedItem?.title = feed.mode
-        showItem?.title = reasons.contains(.hidden) ? "Show Wallpaper" : "Hide Wallpaper"
-        pauseItem?.title = reasons.contains(.manual) ? "Resume" : "Pause"
-        loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        matchItem?.state = settings.matchDesktop ? .on : .off
-        fillDesignMenu()
-        fillRefreshMenu()
-    }
-
-    private func fillDesignMenu() {
-        guard let designMenu else { return }
-        designMenu.removeAllItems()
+    private func menuState() -> MenuState {
         let designs = Designs.list()
         let shown = target.design.flatMap { id in designs.first { $0.id == id }?.name }
-        designMenuItem?.title = "Design: " + (shown ?? target.label)
-        if designs.isEmpty {
-            let empty = designMenu.addItem(withTitle: "No designs in \(Designs.root.path)", action: nil, keyEquivalent: "")
-            empty.isEnabled = false
-        }
-        for design in designs {
-            let title = design.hasPage ? design.name : "\(design.name) (no index.html yet)"
-            let entry = designMenu.addItem(withTitle: title, action: #selector(chooseDesign(_:)), keyEquivalent: "")
-            entry.target = self
-            entry.representedObject = design.id
-            entry.isEnabled = design.hasPage
-            entry.state = design.id == target.design ? .on : .off
+        return MenuState(
+            light: reasons.isEmpty ? .running : reasons == [.covered] ? .covered : .paused,
+            // "Paused by you", "Desktop covered, Low Power Mode": the light already says paused.
+            stateText: reasons.isEmpty ? "Running" : PauseReason.allCases.filter(reasons.contains)
+                .map(\.rawValue).joined(separator: ", ").capitalisingFirst,
+            // Under a cover the feed runs slower than the period: say so.
+            feedText: holding ? "\(feed.source), held at \(feed.periodMs) ms" : feed.source,
+            designName: shown ?? target.label,
+            periodMs: settings.periodMs,
+            designs: designs.map { MenuState.DesignEntry(id: $0.id, name: $0.name, hasPage: $0.hasPage) },
+            currentDesign: target.design,
+            designsFolder: (Designs.root.path as NSString).abbreviatingWithTildeInPath,
+            hidden: reasons.contains(.hidden),
+            pausedByYou: reasons.contains(.manual),
+            matchDesktop: settings.matchDesktop,
+            launchAtLogin: SMAppService.mainApp.status == .enabled)
+    }
+
+    // The shown design's picture in the grid, from the main display's newest desktop snapshot,
+    // when that was taken after the design last painted (so it is of this design, drawn).
+    private func refreshDesignPicture() {
+        guard let painted, painted.design == target.design, let screen = NSScreen.screens.first,
+              let snapshot = DesktopMatcher.newestPicture(Self.displayID(screen)),
+              let taken = DesignPictures.modified(snapshot), taken > painted.at
+        else { return }
+        if DesignPictures.refresh(painted.design, from: snapshot) {
+            log("menu: picture of design \(painted.design) from \(snapshot.lastPathComponent)")
         }
     }
 
-    private func fillRefreshMenu() {
-        guard let refreshMenu else { return }
-        refreshMenu.removeAllItems()
-        refreshMenuItem?.title = "Refresh: \(settings.periodMs) ms"
-        for ms in stride(from: Settings.minPeriod, through: Settings.maxPeriod, by: Settings.step) {
-            let entry = refreshMenu.addItem(withTitle: "\(ms) ms", action: #selector(chooseRefresh(_:)), keyEquivalent: "")
-            entry.target = self
-            entry.tag = ms
-            entry.state = ms == settings.periodMs ? .on : .off
-        }
-        refreshMenu.addItem(.separator())
-        let faster = refreshMenu.addItem(withTitle: "Faster  ⌃⌥=", action: #selector(faster), keyEquivalent: "")
-        faster.target = self
-        faster.isEnabled = settings.periodMs > Settings.minPeriod
-        let slower = refreshMenu.addItem(withTitle: "Slower  ⌃⌥-", action: #selector(slower), keyEquivalent: "")
-        slower.target = self
-        slower.isEnabled = settings.periodMs < Settings.maxPeriod
-    }
-
-    @objc private func chooseDesign(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
+    private func chooseDesign(_ id: String) {
         var next = settings
         next.design = id
         choose(next, source: "menu")
     }
 
-    @objc private func chooseRefresh(_ sender: NSMenuItem) {
+    private func setMatchDesktop(_ on: Bool) {
         var next = settings
-        next.periodMs = Settings.clamp(sender.tag)
+        next.matchDesktop = on
         choose(next, source: "menu")
     }
 
-    @objc private func toggleMatchDesktop() {
-        var next = settings
-        next.matchDesktop.toggle()
-        choose(next, source: "menu")
-    }
-
-    @objc private func faster() { stepPeriod(-Settings.step, source: "menu") }
-
-    @objc private func slower() { stepPeriod(Settings.step, source: "menu") }
-
-    @objc private func togglePause() {
+    private func togglePause() {
         set(.manual, !reasons.contains(.manual))
     }
 
-    @objc private func reloadPage() {
+    private func reloadPage() {
         // A design (or the old page folder) may have appeared since: pick it up.
         log("reloading the page (menu)")
         let before = target
@@ -1129,31 +1099,37 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         if target == before { reloadPages() }
     }
 
-    @objc private func openPageFolder() {
+    private func openPageFolder() {
         NSWorkspace.shared.open(target.index.deletingLastPathComponent())
     }
 
-    @objc private func toggleLaunchAtLogin() {
+    // Returns whether it is on now. A failure is shown once the menu has closed.
+    private func setLaunchAtLogin(_ on: Bool) -> Bool {
         do {
-            if SMAppService.mainApp.status == .enabled {
-                try SMAppService.mainApp.unregister()
-                log("launch at login off")
-            } else {
+            if on {
                 try SMAppService.mainApp.register()
                 log("launch at login on")
+            } else {
+                try SMAppService.mainApp.unregister()
+                log("launch at login off")
             }
         } catch {
-            let alert = NSAlert()
-            alert.messageText = "Couldn't change Launch at Login"
-            alert.informativeText = error.localizedDescription
-            NSApp.activate()
-            alert.runModal()
+            log("launch at login: \(error.localizedDescription)")
+            menu?.menu.cancelTracking()
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = "Couldn't change Launch at Login"
+                alert.informativeText = error.localizedDescription
+                NSApp.activate()
+                alert.runModal()
+            }
         }
+        return SMAppService.mainApp.status == .enabled
     }
+}
 
-    @objc private func quit() {
-        NSApp.terminate(nil)
-    }
+private extension String {
+    var capitalisingFirst: String { prefix(1).uppercased() + dropFirst() }
 }
 
 // The user content controller retains its handlers; this keeps it from retaining the app.

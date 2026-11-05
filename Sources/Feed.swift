@@ -37,9 +37,14 @@ final class Feed {
     private(set) var periodMs = Settings.defaults.periodMs
 
     var mode: String {
+        wanted && (process != nil || stubTimer != nil) ? "\(source), \(periodMs) ms" : source
+    }
+
+    // The same without the period, for the menu, which shows the period on its own.
+    var source: String {
         if !wanted { return "Feed stopped" }
-        if let process { return "Feed: kiln-feed.py (pid \(process.processIdentifier)), \(periodMs) ms" }
-        if stubTimer != nil { return "Feed: built-in stub (kiln-feed.py missing), \(periodMs) ms" }
+        if let process { return "Feed: kiln-feed.py (pid \(process.processIdentifier))" }
+        if stubTimer != nil { return "Feed: built-in stub (kiln-feed.py missing)" }
         return "Feed: restarting kiln-feed.py"
     }
 
