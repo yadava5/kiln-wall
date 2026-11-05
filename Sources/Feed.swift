@@ -1,5 +1,7 @@
 // The data feed: kiln-feed.py as a child process, one JSON object per stdout line, or a built-in
 // stub while that script does not exist. Started and stopped by KilnWall as visibility changes.
+// The child's stdin is a pipe: `period <ms>\n` on it changes the period live (no restart), and
+// closing it (EOF) ends the child.
 import Foundation
 import os
 
@@ -28,12 +30,34 @@ final class Feed {
     private var restartWork: DispatchWorkItem?
     private var backoff: TimeInterval = 1
     private var lines = 0
+    // The write end of the current child's stdin.
+    private var commands: FileHandle?
+    // What every child is started with, and told when it changes.
+    private(set) var periodMs = Settings.defaults.periodMs
 
     var mode: String {
         if !wanted { return "Feed stopped" }
-        if let process { return "Feed: kiln-feed.py (pid \(process.processIdentifier))" }
-        if stubTimer != nil { return "Feed: built-in stub (kiln-feed.py missing)" }
+        if let process { return "Feed: kiln-feed.py (pid \(process.processIdentifier)), \(periodMs) ms" }
+        if stubTimer != nil { return "Feed: built-in stub (kiln-feed.py missing), \(periodMs) ms" }
         return "Feed: restarting kiln-feed.py"
+    }
+
+    // Live: a running child is told on its stdin, so it keeps its state and pid. A child started
+    // later (start, restart after a crash) is started with the current period.
+    func setPeriod(_ ms: Int) {
+        let ms = Settings.clamp(ms)
+        guard ms != periodMs else { return }
+        periodMs = ms
+        if let process, let commands {
+            do {
+                try commands.write(contentsOf: Data("period \(ms)\n".utf8))
+                log("feed: told kiln-feed.py (pid \(process.processIdentifier)) period \(ms) ms")
+            } catch {
+                log("feed: cannot send the period to kiln-feed.py (pid \(process.processIdentifier)): \(error.localizedDescription)")
+            }
+        } else if stubTimer != nil {
+            startStubTimer()
+        }
     }
 
     func start() {
@@ -57,6 +81,7 @@ final class Feed {
         guard let process else { return nil }
         generation += 1
         self.process = nil
+        closeCommands()
         if process.isRunning { process.terminate() }
         log("feed: stopped kiln-feed.py (pid \(process.processIdentifier))")
         return process
@@ -77,12 +102,12 @@ final class Feed {
     private func spawn() {
         let child = Process()
         child.executableURL = URL(fileURLWithPath: Self.python)
-        child.arguments = [script, "--stream", "--hz", "1"]
+        child.arguments = [script, "--stream", "--period-ms", String(periodMs)]
         var environment = ProcessInfo.processInfo.environment
         environment["PYTHONUNBUFFERED"] = "1"  // a pipe would otherwise hold lines in a 4 KB buffer
         child.environment = environment
-        child.standardInput = FileHandle.nullDevice
-        let out = Pipe(), err = Pipe()
+        let input = Pipe(), out = Pipe(), err = Pipe()
+        child.standardInput = input
         child.standardOutput = out
         child.standardError = err
 
@@ -118,8 +143,9 @@ final class Feed {
         do {
             try child.run()
             process = child
+            commands = input.fileHandleForWriting
             startedAt = Date()
-            log("feed: started kiln-feed.py (pid \(child.processIdentifier))")
+            log("feed: started kiln-feed.py (pid \(child.processIdentifier)) at \(periodMs) ms")
         } catch {
             log("feed: cannot start kiln-feed.py: \(error.localizedDescription)")
             scheduleRestart()
@@ -140,9 +166,16 @@ final class Feed {
     private func exited(status: Int32, signalled: Bool, from source: Int) {
         guard source == generation, wanted else { return }  // stopped on purpose, or superseded
         process = nil
+        closeCommands()
         if Date().timeIntervalSince(startedAt) >= Self.healthyRun { backoff = 1 }
         log("feed: kiln-feed.py \(signalled ? "killed by signal" : "exited with status") \(status)")
         scheduleRestart()
+    }
+
+    // EOF on the child's stdin: it ends by itself (stop() also sends SIGTERM).
+    private func closeCommands() {
+        try? commands?.close()
+        commands = nil
     }
 
     private func scheduleRestart() {
@@ -165,18 +198,24 @@ final class Feed {
         guard stubTimer == nil else { return }
         log("feed: \(script) not found; using the built-in stub, retrying every \(Int(Self.retryInterval)) s")
         emitStub()
-        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.emitStub() }
-        }
-        timer.tolerance = 0.1
-        RunLoop.main.add(timer, forMode: .common)
-        stubTimer = timer
+        startStubTimer()
         let retry = Timer(timeInterval: Self.retryInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.retryReal() }
         }
         retry.tolerance = 2
         RunLoop.main.add(retry, forMode: .common)
         retryTimer = retry
+    }
+
+    private func startStubTimer() {
+        stubTimer?.invalidate()
+        let interval = Double(periodMs) / 1000
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.emitStub() }
+        }
+        timer.tolerance = interval / 10
+        RunLoop.main.add(timer, forMode: .common)
+        stubTimer = timer
     }
 
     private func stopStub() {
@@ -188,7 +227,7 @@ final class Feed {
 
     private func emitStub() {
         let now = (Date().timeIntervalSince1970 * 1000).rounded() / 1000
-        onJSON?(["v": 1, "t": now, "stub": true])
+        onJSON?(["v": 1, "t": now, "stub": true, "feed": ["period_ms": periodMs]])
     }
 
     private func retryReal() {

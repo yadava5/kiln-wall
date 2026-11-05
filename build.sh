@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds build/KilnWall.app. `./build.sh install` also copies it to ~/Applications (without
-# launching it) and seeds ~/.config/kiln-wall/page/ with the stub page if that folder is missing.
+# launching it). It seeds nothing in ~/.config/kiln-wall: the pages are the design folders in
+# ~/.config/kiln-wall/designs/, and the stub page bundled here is the last fallback.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -20,11 +21,6 @@ if [[ ${1:-} == install ]]; then
   if [[ -e ~/Applications/KilnWall.app ]]; then /bin/rm -r ~/Applications/KilnWall.app; fi
   ditto "$app" ~/Applications/KilnWall.app
   echo "installed ~/Applications/KilnWall.app"
-  if [[ ! -d ~/.config/kiln-wall/page ]]; then
-    /bin/mkdir -p ~/.config/kiln-wall
-    /bin/cp -R page ~/.config/kiln-wall/page
-    echo "seeded ~/.config/kiln-wall/page with the stub page"
-  fi
   if /usr/bin/pgrep -x KilnWall >/dev/null; then
     echo "note: KilnWall is running the previous build; quit and reopen it to use this one"
   fi

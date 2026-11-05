@@ -1,10 +1,16 @@
 // KilnWall — a local HTML dashboard as the desktop wallpaper, fed live JSON.
 //
 // One borderless window per screen sits one level below the desktop icons (so above LiveWall's
-// video, which sits at the desktop level) and holds a WKWebView showing page/index.html. Each JSON
-// line from the feed (Feed.swift) is handed to the page as window.kiln.update(data). Whenever
-// nobody can see the wallpaper the feed is stopped and the page is told window.kiln.pause().
+// video, which sits at the desktop level) and holds a WKWebView showing the chosen design,
+// ~/.config/kiln-wall/designs/<design>/index.html. Each JSON line from the feed (Feed.swift) is
+// handed to the page as window.kiln.update(data), and the design and refresh period (100..1000 ms,
+// settings.json, see Settings.swift) as window.kiln.config({design, period_ms}). Whenever nobody
+// can see the wallpaper the feed is stopped and the page is told window.kiln.pause().
+//
+// The period and design change live, from the menu-bar item, the global hotkeys ⌃⌥= (faster,
+// −100 ms) and ⌃⌥- (slower, +100 ms), or the `kiln-wall` CLI, which writes settings.json.
 import AppKit
+import Carbon.HIToolbox
 import os
 import ServiceManagement
 import WebKit
@@ -32,17 +38,18 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
     private static let coveragePoll: TimeInterval = 2
     private static let reloadDebounce: TimeInterval = 0.3
 
-    static let userPageFolder = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".config/kiln-wall/page", isDirectory: true)
-
     private var windows: [CGDirectDisplayID: NSWindow] = [:]
     private var webViews: [CGDirectDisplayID: WKWebView] = [:]
     private var reasons: Set<PauseReason> = []
     private var running = false  // feed on and page told to animate
     private var coverageTimer: Timer?
-    private var pageFolder = KilnWall.resolvePageFolder()
+    private var settings = Settings.load()
+    private lazy var target = PageTarget.resolve(settings.design)
     private var watcher: FolderWatcher?
+    private var settingsWatcher: SettingsWatcher?
+    private let hotkeys = Hotkeys()
     private var reloadWork: DispatchWorkItem?
+    private var changedPaths: [String] = []
     private var signals: [DispatchSourceSignal] = []
     private var statusItem: NSStatusItem?
     private var stateItem: NSMenuItem?
@@ -50,18 +57,24 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
     private var showItem: NSMenuItem?
     private var pauseItem: NSMenuItem?
     private var loginItem: NSMenuItem?
+    private var designMenu: NSMenu?
+    private var designMenuItem: NSMenuItem?
+    private var refreshMenu: NSMenu?
+    private var refreshMenuItem: NSMenuItem?
     private let feed = Feed()
     private var acknowledged = 0
     private var scriptErrors = 0
-    // kiln-feed sends `analytics` only on lines where it changed. A page that loads after that
-    // line (launch race, live reload, WebContent restart) gets this replayed on load.
-    private var lastAnalytics: Any?
+    private var replay = ReplayCache()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        log("started; page folder \(pageFolder.path)")
+        log("started; design \(settings.design), period \(settings.periodMs) ms; designs in \(Designs.root.path)")
+        logTarget()
+        feed.setPeriod(settings.periodMs)
         feed.onJSON = { [weak self] json in self?.push(json) }
         buildStatusItem()
         watchPageFolder()
+        settingsWatcher = SettingsWatcher { [weak self] in self?.settingsFileChanged() }
+        registerHotkeys()
         watchSystem()
         syncWindows()
         refreshLowPower()
@@ -104,17 +117,98 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         return "Paused: " + PauseReason.allCases.filter(reasons.contains).map(\.rawValue).joined(separator: ", ")
     }
 
-    // MARK: Page
+    // MARK: Design and period
 
-    static func resolvePageFolder() -> URL {
-        var isFolder: ObjCBool = false
-        if FileManager.default.fileExists(atPath: userPageFolder.path, isDirectory: &isFolder), isFolder.boolValue {
-            return userPageFolder
+    // Applies only what changed. Every writer of settings.json lands here: this app's menu and
+    // hotkeys apply first and then write the file, so the watcher's re-read finds nothing new.
+    private func applySettings(_ new: Settings, source: String) {
+        let old = settings
+        guard new != old else { return }
+        settings = new
+        if new.periodMs != old.periodMs {
+            log("period \(old.periodMs) -> \(new.periodMs) ms (\(source))")
+            feed.setPeriod(new.periodMs)
         }
-        return Bundle.main.resourceURL!.appendingPathComponent("page", isDirectory: true)
+        if new.design != old.design {
+            log("design \(old.design) -> \(new.design) (\(source))")
+            retarget()
+        }
+        configureEverywhere()
     }
 
-    // The next three are shared with the headless modes (Headless.swift), so a snapshot loads and
+    // A choice made here: apply, then record it in settings.json.
+    private func choose(_ new: Settings, source: String) {
+        if new == settings {
+            log("\(source): already design \(new.design), period \(new.periodMs) ms")
+            return
+        }
+        applySettings(new, source: source)
+        do {
+            try new.write()
+        } catch {
+            log("settings: cannot write \(Settings.file.path): \(error.localizedDescription)")
+        }
+    }
+
+    private func settingsFileChanged() {
+        guard let read = Settings.reread(over: settings) else {
+            log("settings: \(Settings.file.path) missing or unreadable; keeping design \(settings.design), period \(settings.periodMs) ms")
+            return
+        }
+        applySettings(read, source: "settings file")
+    }
+
+    private func stepPeriod(_ delta: Int, source: String) {
+        choose(Settings(design: settings.design, periodMs: Settings.clamp(settings.periodMs + delta)), source: source)
+    }
+
+    // ⌃⌥= faster (−100 ms), ⌃⌥- slower (+100 ms): like btop, "+" is faster.
+    private func registerHotkeys() {
+        let chord = controlKey | optionKey
+        let faster = hotkeys.register(keyCode: kVK_ANSI_Equal, modifiers: chord) { [weak self] in
+            self?.stepPeriod(-Settings.step, source: "hotkey")
+        }
+        let slower = hotkeys.register(keyCode: kVK_ANSI_Minus, modifiers: chord) { [weak self] in
+            self?.stepPeriod(Settings.step, source: "hotkey")
+        }
+        func result(_ status: OSStatus) -> String { status == noErr ? "registered" : "FAILED (OSStatus \(status))" }
+        log("hotkeys: ⌃⌥= (faster) \(result(faster)); ⌃⌥- (slower) \(result(slower))")
+    }
+
+    // Re-resolves the page; loads it everywhere if it is a different one.
+    private func retarget() {
+        let next = PageTarget.resolve(settings.design)
+        guard next != target else { return }
+        target = next
+        logTarget()
+        watchPageFolder()
+        reloadPages()
+    }
+
+    private func logTarget() {
+        if target.design == settings.design {
+            log("page: \(target.label), \(target.index.path)")
+        } else {
+            log("page: design \(settings.design) has no index.html in \(Designs.root.path); showing \(target.label) (\(target.index.path))")
+        }
+    }
+
+    // What the page is told: the design it is (the chosen one, or the fallback actually shown).
+    private var pageConfig: [String: Any] {
+        ["design": target.design ?? settings.design, "period_ms": settings.periodMs]
+    }
+
+    private func configureEverywhere() {
+        for webView in webViews.values { configure(webView) }
+    }
+
+    private func configure(_ webView: WKWebView) {
+        Self.configure(webView, pageConfig) { [weak self] error in self?.scriptFailed(error) }
+    }
+
+    // MARK: Page
+
+    // The next four are shared with the headless modes (Headless.swift), so a snapshot loads and
     // feeds the page exactly as the wallpaper does.
     static func makeWebView(size: NSSize, messages: WKScriptMessageHandler) -> WKWebView {
         let configuration = WKWebViewConfiguration()
@@ -127,8 +221,9 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         return webView
     }
 
-    static func loadPage(_ webView: WKWebView, from folder: URL) {
-        webView.loadFileURL(folder.appendingPathComponent("index.html"), allowingReadAccessTo: folder)
+    // A design reads the whole designs folder (its pages load ../_shared/kiln-runtime.js).
+    static func loadPage(_ webView: WKWebView, _ target: PageTarget) {
+        webView.loadFileURL(target.index, allowingReadAccessTo: target.readAccess)
     }
 
     // Data for the page: the parsed JSON object, passed as a real JS object (no string building).
@@ -140,26 +235,57 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         }
     }
 
+    // {design, period_ms} for the page: after every load and on every change.
+    static func configure(_ webView: WKWebView, _ config: [String: Any], onError: @escaping (Error) -> Void) {
+        webView.callAsyncJavaScript(
+            "window.kiln && window.kiln.config && window.kiln.config(c)", arguments: ["c": config], in: nil, in: .page
+        ) { result in
+            if case .failure(let error) = result { onError(error) }
+        }
+    }
+
     private func load(_ webView: WKWebView) {
-        Self.loadPage(webView, from: pageFolder)
+        Self.loadPage(webView, target)
     }
 
+    // The designs folder, recursively (a new design, or the chosen one gaining its index.html,
+    // retargets), plus the old page folder while that is what is shown.
     private func watchPageFolder() {
-        watcher = FolderWatcher(pageFolder) { [weak self] in self?.pageFilesChanged() }
+        var folders = [Designs.root]
+        if target.design == nil { folders.append(target.readAccess) }
+        watcher = FolderWatcher(folders) { [weak self] paths in self?.pageFilesChanged(paths) }
     }
 
-    // Editors save in bursts (temp file, rename, attributes): one reload per burst.
-    private func pageFilesChanged() {
+    // Editors save in bursts (temp file, rename, attributes): one reload per burst. Only a change
+    // to the page being shown (its design folder or _shared) reloads it; the other designs'
+    // folders change all the time while they are worked on.
+    private func pageFilesChanged(_ paths: [String]) {
+        changedPaths += paths
         reloadWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            MainActor.assumeIsolated {
-                self?.reloadWork = nil
-                log("page files changed; reloading")
-                self?.reloadPages()
-            }
+            MainActor.assumeIsolated { self?.pageFilesSettled() }
         }
         reloadWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.reloadDebounce, execute: work)
+    }
+
+    private func pageFilesSettled() {
+        reloadWork = nil
+        let paths = changedPaths
+        changedPaths = []
+        let before = target
+        retarget()
+        if target != before { return }
+        if let changed = paths.first(where: touchesTarget) {
+            log("page files changed (\(changed)); reloading")
+            reloadPages()
+        }
+    }
+
+    private func touchesTarget(_ path: String) -> Bool {
+        let shown = canonicalPath(target.index.deletingLastPathComponent())
+        let shared = canonicalPath(Designs.root.appendingPathComponent("_shared", isDirectory: true))
+        return [shown, shared].contains { path == $0 || path.hasPrefix($0 + "/") }
     }
 
     private func reloadPages() {
@@ -167,7 +293,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
     }
 
     private func push(_ json: [String: Any]) {
-        if let analytics = json["analytics"] { lastAnalytics = analytics }
+        replay.note(json)
         for webView in webViews.values {
             Self.send(json, to: webView) { [weak self] error in self?.scriptFailed(error) }
         }
@@ -203,11 +329,11 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         let display = webViews.first { $0.value === webView }?.key ?? 0
         log("page loaded on display \(display) (WebContent pid \(Self.webProcessID(webView)))")
         scriptErrors = 0
+        configure(webView)
         // A partial update: the page merges it with the next full line.
-        if let analytics = lastAnalytics {
-            Self.send(["replay": true, "analytics": analytics], to: webView) { [weak self] error in
-                self?.scriptFailed(error)
-            }
+        if let line = replay.line {
+            log("page: replayed \(ReplayCache.keys.filter { replay.blocks[$0] != nil }.joined(separator: ", "))")
+            Self.send(line, to: webView) { [weak self] error in self?.scriptFailed(error) }
         }
         if !running {
             webView.callAsyncJavaScript(
@@ -451,6 +577,15 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         menu.addItem(.separator())
         showItem = menu.addItem(withTitle: "Hide Wallpaper", action: #selector(toggleShown), keyEquivalent: "")
         pauseItem = menu.addItem(withTitle: "Pause", action: #selector(togglePause), keyEquivalent: "")
+        menu.addItem(.separator())
+        designMenu = NSMenu()
+        designMenu?.autoenablesItems = false
+        designMenuItem = menu.addItem(withTitle: "Design", action: nil, keyEquivalent: "")
+        designMenuItem?.submenu = designMenu
+        refreshMenu = NSMenu()
+        refreshMenu?.autoenablesItems = false
+        refreshMenuItem = menu.addItem(withTitle: "Refresh", action: nil, keyEquivalent: "")
+        refreshMenuItem?.submenu = refreshMenu
         menu.addItem(withTitle: "Reload Page", action: #selector(reloadPage), keyEquivalent: "")
         menu.addItem(withTitle: "Open Page Folder", action: #selector(openPageFolder), keyEquivalent: "")
         menu.addItem(.separator())
@@ -462,32 +597,83 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         statusItem = item
     }
 
+    // The submenus are rebuilt each time the menu opens: designs come and go on disk.
     func menuNeedsUpdate(_ menu: NSMenu) {
         stateItem?.title = stateText
         feedItem?.title = feed.mode
         showItem?.title = reasons.contains(.hidden) ? "Show Wallpaper" : "Hide Wallpaper"
         pauseItem?.title = reasons.contains(.manual) ? "Resume" : "Pause"
         loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        fillDesignMenu()
+        fillRefreshMenu()
     }
+
+    private func fillDesignMenu() {
+        guard let designMenu else { return }
+        designMenu.removeAllItems()
+        let designs = Designs.list()
+        let shown = target.design.flatMap { id in designs.first { $0.id == id }?.name }
+        designMenuItem?.title = "Design: " + (shown ?? target.label)
+        if designs.isEmpty {
+            let empty = designMenu.addItem(withTitle: "No designs in \(Designs.root.path)", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+        }
+        for design in designs {
+            let title = design.hasPage ? design.name : "\(design.name) (no index.html yet)"
+            let entry = designMenu.addItem(withTitle: title, action: #selector(chooseDesign(_:)), keyEquivalent: "")
+            entry.target = self
+            entry.representedObject = design.id
+            entry.isEnabled = design.hasPage
+            entry.state = design.id == target.design ? .on : .off
+        }
+    }
+
+    private func fillRefreshMenu() {
+        guard let refreshMenu else { return }
+        refreshMenu.removeAllItems()
+        refreshMenuItem?.title = "Refresh: \(settings.periodMs) ms"
+        for ms in stride(from: Settings.minPeriod, through: Settings.maxPeriod, by: Settings.step) {
+            let entry = refreshMenu.addItem(withTitle: "\(ms) ms", action: #selector(chooseRefresh(_:)), keyEquivalent: "")
+            entry.target = self
+            entry.tag = ms
+            entry.state = ms == settings.periodMs ? .on : .off
+        }
+        refreshMenu.addItem(.separator())
+        let faster = refreshMenu.addItem(withTitle: "Faster  ⌃⌥=", action: #selector(faster), keyEquivalent: "")
+        faster.target = self
+        faster.isEnabled = settings.periodMs > Settings.minPeriod
+        let slower = refreshMenu.addItem(withTitle: "Slower  ⌃⌥-", action: #selector(slower), keyEquivalent: "")
+        slower.target = self
+        slower.isEnabled = settings.periodMs < Settings.maxPeriod
+    }
+
+    @objc private func chooseDesign(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        choose(Settings(design: id, periodMs: settings.periodMs), source: "menu")
+    }
+
+    @objc private func chooseRefresh(_ sender: NSMenuItem) {
+        choose(Settings(design: settings.design, periodMs: Settings.clamp(sender.tag)), source: "menu")
+    }
+
+    @objc private func faster() { stepPeriod(-Settings.step, source: "menu") }
+
+    @objc private func slower() { stepPeriod(Settings.step, source: "menu") }
 
     @objc private func togglePause() {
         set(.manual, !reasons.contains(.manual))
     }
 
     @objc private func reloadPage() {
-        // The user folder may have been created since launch: pick it up.
-        let folder = Self.resolvePageFolder()
-        if folder != pageFolder {
-            pageFolder = folder
-            watchPageFolder()
-            log("page folder is now \(folder.path)")
-        }
+        // A design (or the old page folder) may have appeared since: pick it up.
         log("reloading the page (menu)")
-        reloadPages()
+        let before = target
+        retarget()
+        if target == before { reloadPages() }
     }
 
     @objc private func openPageFolder() {
-        NSWorkspace.shared.open(pageFolder)
+        NSWorkspace.shared.open(target.index.deletingLastPathComponent())
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -524,33 +710,37 @@ private final class MessageProxy: NSObject, WKScriptMessageHandler {
     }
 }
 
-// FSEvents on a folder (recursive, file-level), delivered on the main queue.
+// FSEvents on folders (recursive, file-level), delivered on the main queue with the changed paths.
 @MainActor
 final class FolderWatcher {
     private var stream: FSEventStreamRef?
-    private let onChange: () -> Void
+    private let onChange: ([String]) -> Void
 
-    init(_ folder: URL, onChange: @escaping () -> Void) {
+    init(_ folders: [URL], onChange: @escaping ([String]) -> Void) {
         self.onChange = onChange
+        let paths = folders.map(\.path)
         var context = FSEventStreamContext(
             version: 0, info: Unmanaged.passUnretained(self).toOpaque(), retain: nil, release: nil, copyDescription: nil)
-        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+        let callback: FSEventStreamCallback = { _, info, _, eventPaths, _, _ in
             guard let info else { return }
             let watcher = Unmanaged<FolderWatcher>.fromOpaque(info).takeUnretainedValue()
-            MainActor.assumeIsolated { watcher.onChange() }
+            // kFSEventStreamCreateFlagUseCFTypes: the paths are a CFArray of CFString.
+            let paths = Unmanaged<CFArray>.fromOpaque(eventPaths).takeUnretainedValue() as? [String] ?? []
+            MainActor.assumeIsolated { watcher.onChange(paths) }
         }
         guard let stream = FSEventStreamCreate(
-            nil, callback, &context, [folder.path] as CFArray,
+            nil, callback, &context, paths as CFArray,
             FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.05,
-            FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer))
+            FSEventStreamCreateFlags(
+                kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagUseCFTypes))
         else {
-            log("cannot watch \(folder.path)")
+            log("cannot watch \(paths.joined(separator: ", "))")
             return
         }
         FSEventStreamSetDispatchQueue(stream, .main)
         FSEventStreamStart(stream)
         self.stream = stream
-        log("watching \(folder.path) for changes")
+        log("watching \(paths.joined(separator: ", ")) for changes")
     }
 
     deinit {
@@ -563,6 +753,8 @@ final class FolderWatcher {
 }
 
 MainActor.assumeIsolated {
+    // A write to a feed that just died must fail with EPIPE, not kill the app.
+    signal(SIGPIPE, SIG_IGN)
     let app = NSApplication.shared
     // `--snapshot` / `--measure`: the headless modes (Headless.swift), nothing of the wallpaper.
     let headless: HeadlessOptions?

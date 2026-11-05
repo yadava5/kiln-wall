@@ -3,13 +3,14 @@
 // its output:
 //
 //   KilnWall --snapshot out.png [--after 8] [--frames 3 --every 1] [--size 1512x982] [--scale 2]
-//            [--fixture lines.jsonl]
-//   KilnWall --measure 20 [--size 1512x982] [--fixture lines.jsonl]
+//            [--design glass] [--period-ms 300] [--fixture lines.jsonl]
+//   KilnWall --measure 20 [--size 1512x982] [--design glass] [--period-ms 300] [--fixture lines.jsonl]
 //
-// No menu-bar item, no wallpaper windows, no page-folder watcher and no instance check, so a
-// running KilnWall is left alone. The page is loaded and fed exactly as the wallpaper does it
-// (same folder, same web view setup, same window.kiln.update(data) call), in a window that WebKit
-// treats as visible but nobody can see (see makeWindow).
+// No menu-bar item, no wallpaper windows, no page-folder or settings watcher, no hotkeys and no
+// instance check, so a running KilnWall is left alone; settings.json is read, never written. The
+// page is loaded and fed exactly as the wallpaper does it (same page resolution, same web view
+// setup, same window.kiln.config / update calls, the same replay when the page reloads itself),
+// in a window that WebKit treats as visible but nobody can see (see makeWindow).
 import AppKit
 import Darwin
 import ImageIO
@@ -22,14 +23,20 @@ struct HeadlessOptions {
 
     static let usage = """
         usage: KilnWall --snapshot <out.png> [--after <s>] [--frames <n> --every <s>]
-                        [--size <WxH>] [--scale 1|2] [--fixture <file.jsonl>]
-               KilnWall --measure <s> [--size <WxH>] [--fixture <file.jsonl>]
+                        [--size <WxH>] [--scale 1|2] [--design <id>] [--period-ms <ms>]
+                        [--fixture <file.jsonl>]
+               KilnWall --measure <s> [--size <WxH>] [--design <id>] [--period-ms <ms>]
+                        [--fixture <file.jsonl>]
 
           --snapshot  write a PNG of the page --after seconds (default 8) after it loads; with
                       --frames n, write <out>-01.png ... <out>-n.png, --every seconds apart (default 1)
           --measure   run the page for that many seconds and print the CPU time it cost
           --size      window size in points (default: the main screen's frame size)
           --scale     PNG pixels per point, 1 or 2 (default 2)
+          --design    the design folder to show, from the designs folder ($KILN_DESIGNS_DIR or
+                      ~/.config/kiln-wall/designs); default: settings.json's, with the wallpaper's
+                      fallbacks
+          --period-ms the live feed's period, 100 to 1000 ms (default: settings.json's)
           --fixture   replay this file's JSON lines at 1 Hz, looping, instead of kiln-feed.py
         """
 
@@ -41,6 +48,8 @@ struct HeadlessOptions {
     var size: NSSize?
     var scale = 2
     var fixture: String?
+    var design: String?
+    var periodMs: Int?
 
     // nil: not a headless run (the wallpaper).
     static func parse(_ arguments: [String]) throws -> HeadlessOptions? {
@@ -85,6 +94,20 @@ struct HeadlessOptions {
                 guard let n = Int(text), n == 1 || n == 2 else { throw UsageError(description: "--scale: 1 or 2") }
                 options.scale = n
             case "--fixture": options.fixture = try value(flag)
+            case "--design":
+                let id = try value(flag)
+                guard Designs.hasPage(id) else {
+                    let known = Designs.list().filter(\.hasPage).map(\.id)
+                    throw UsageError(description: "--design \(id): no \(Designs.index(of: id).path)"
+                        + " (designs: \(known.isEmpty ? "none" : known.joined(separator: ", ")))")
+                }
+                options.design = id
+            case "--period-ms":
+                let n = try number(flag, atLeast: Double(Settings.minPeriod))
+                guard n == n.rounded(), n <= Double(Settings.maxPeriod) else {
+                    throw UsageError(description: "--period-ms: a whole number of ms, \(Settings.minPeriod) to \(Settings.maxPeriod)")
+                }
+                options.periodMs = Int(n)
             default: throw UsageError(description: "unknown argument \(flag)")
             }
             i += 1
@@ -131,7 +154,10 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
 
     private let options: HeadlessOptions
     private let feed = Feed()
-    private let pageFolder = KilnWall.resolvePageFolder()
+    private let settings = Settings.load()
+    private lazy var target = options.design.map { PageTarget.design($0) } ?? PageTarget.resolve(settings.design)
+    private lazy var periodMs = options.periodMs ?? settings.periodMs
+    private var replay = ReplayCache()
     private var window: NSWindow?
     private var webView: WKWebView?
     private var loadedAt: Date?
@@ -166,8 +192,12 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
         window.orderFront(nil)
         self.window = window
         self.webView = webView
-        say("page \(pageFolder.path)/index.html at \(Int(size.width))x\(Int(size.height)) pt, backing scale \(window.backingScaleFactor)")
-        KilnWall.loadPage(webView, from: pageFolder)
+        if options.design == nil, target.design != settings.design {
+            say("design \(settings.design) (settings.json) has no index.html; showing \(target.label)")
+        }
+        say("page \(target.index.path) (\(target.label)) at \(Int(size.width))x\(Int(size.height)) pt, backing scale \(window.backingScaleFactor), period \(periodMs) ms")
+        feed.setPeriod(periodMs)
+        KilnWall.loadPage(webView, target)
         after(Self.loadTimeout) { me in
             if me.loadedAt == nil { me.fail("the page did not finish loading within \(Int(Self.loadTimeout)) s") }
         }
@@ -217,7 +247,20 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
     // MARK: Page and data
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard loadedAt == nil else { return }
+        KilnWall.configure(webView, ["design": target.design ?? settings.design, "period_ms": periodMs]) { [weak self] error in
+            self?.say("page config error: \(error.localizedDescription)")
+        }
+        // The page navigated itself (a reload): as on the wallpaper, it gets the last on-change
+        // blocks replayed, and the run (data, snapshot clock) carries on.
+        if loadedAt != nil {
+            if let line = replay.line {
+                say("page reloaded; replayed \(ReplayCache.keys.filter { replay.blocks[$0] != nil }.joined(separator: ", "))")
+                push(line)
+            } else {
+                say("page reloaded; nothing to replay yet")
+            }
+            return
+        }
         loadedAt = Date()
         say("page loaded (WebContent pid \(KilnWall.webProcessID(webView)))")
         // Only now: the first line is the only one certain to carry `analytics` (the feed sends it
@@ -268,6 +311,7 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
 
     private func push(_ json: [String: Any]) {
         guard let webView else { return }
+        replay.note(json)
         pushed += 1
         KilnWall.send(json, to: webView) { [weak self] error in
             guard let self else { return }
