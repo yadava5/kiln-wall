@@ -3,7 +3,7 @@
 // One borderless window per screen sits one level below the desktop icons (so above LiveWall's
 // video, which sits at the desktop level) and holds a WKWebView showing the chosen design,
 // ~/.config/kiln-wall/designs/<design>/index.html. Each JSON line from the feed (Feed.swift) is
-// handed to the page as window.kiln.update(data), and the design and refresh period (100..1000 ms,
+// handed to the page as its raw text, window.kiln.update(line), and the design and refresh period (100..1000 ms,
 // settings.json, see Settings.swift) as window.kiln.config({design, period_ms}). Whenever nobody
 // can see the wallpaper the feed is stopped and the page is told window.kiln.pause().
 //
@@ -70,7 +70,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         log("started; design \(settings.design), period \(settings.periodMs) ms; designs in \(Designs.root.path)")
         logTarget()
         feed.setPeriod(settings.periodMs)
-        feed.onJSON = { [weak self] json in self?.push(json) }
+        feed.onLine = { [weak self] line in self?.push(line) }
         buildStatusItem()
         watchPageFolder()
         settingsWatcher = SettingsWatcher { [weak self] in self?.settingsFileChanged() }
@@ -226,10 +226,13 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         webView.loadFileURL(target.index, allowingReadAccessTo: target.readAccess)
     }
 
-    // Data for the page: the parsed JSON object, passed as a real JS object (no string building).
-    static func send(_ json: [String: Any], to webView: WKWebView, onError: @escaping (Error) -> Void) {
+    // Data for the page: the line's raw text as a String argument (no string building), which the
+    // runtime JSON.parses. Measured 2026-11-04 at 100 ms on a page that draws nothing, against
+    // parsing it here and bridging the nested object: host 1.0% -> 0.7% of a core, WebContent
+    // 0.8% -> 0.5%. (On glass the host stays ~3%: that is WebKit serving the page's frames.)
+    static func send(_ line: String, to webView: WKWebView, onError: @escaping (Error) -> Void) {
         webView.callAsyncJavaScript(
-            "window.kiln && window.kiln.update(data)", arguments: ["data": json], in: nil, in: .page
+            "window.kiln && window.kiln.update(line)", arguments: ["line": line], in: nil, in: .page
         ) { result in
             if case .failure(let error) = result { onError(error) }
         }
@@ -292,10 +295,10 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         for webView in webViews.values { load(webView) }
     }
 
-    private func push(_ json: [String: Any]) {
-        replay.note(json)
+    private func push(_ line: String) {
+        replay.note(line)
         for webView in webViews.values {
-            Self.send(json, to: webView) { [weak self] error in self?.scriptFailed(error) }
+            Self.send(line, to: webView) { [weak self] error in self?.scriptFailed(error) }
         }
     }
 
@@ -332,7 +335,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, NSMenuDelegate, WKNavigat
         configure(webView)
         // A partial update: the page merges it with the next full line.
         if let line = replay.line {
-            log("page: replayed \(ReplayCache.keys.filter { replay.blocks[$0] != nil }.joined(separator: ", "))")
+            log("page: replayed \(replay.held)")
             Self.send(line, to: webView) { [weak self] error in self?.scriptFailed(error) }
         }
         if !running {
@@ -755,6 +758,11 @@ final class FolderWatcher {
 MainActor.assumeIsolated {
     // A write to a feed that just died must fail with EPIPE, not kill the app.
     signal(SIGPIPE, SIG_IGN)
+    // Before anything starts: `--help` must not launch the wallpaper.
+    if CommandLine.arguments.dropFirst().contains(where: { $0 == "--help" || $0 == "-h" }) {
+        print(HeadlessOptions.usage)
+        exit(0)
+    }
     let app = NSApplication.shared
     // `--snapshot` / `--measure`: the headless modes (Headless.swift), nothing of the wallpaper.
     let headless: HeadlessOptions?

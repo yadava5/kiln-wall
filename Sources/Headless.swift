@@ -22,7 +22,8 @@ struct HeadlessOptions {
     }
 
     static let usage = """
-        usage: KilnWall --snapshot <out.png> [--after <s>] [--frames <n> --every <s>]
+        usage: KilnWall                (no arguments: the wallpaper; launch it with `open`)
+               KilnWall --snapshot <out.png> [--after <s>] [--frames <n> --every <s>]
                         [--size <WxH>] [--scale 1|2] [--design <id>] [--period-ms <ms>]
                         [--fixture <file.jsonl>]
                KilnWall --measure <s> [--size <WxH>] [--design <id>] [--period-ms <ms>]
@@ -38,6 +39,7 @@ struct HeadlessOptions {
                       fallbacks
           --period-ms the live feed's period, 100 to 1000 ms (default: settings.json's)
           --fixture   replay this file's JSON lines at 1 Hz, looping, instead of kiln-feed.py
+          -h, --help  print this and exit
         """
 
     var output: String?
@@ -98,7 +100,11 @@ struct HeadlessOptions {
                 let id = try value(flag)
                 guard Designs.hasPage(id) else {
                     let known = Designs.list().filter(\.hasPage).map(\.id)
-                    throw UsageError(description: "--design \(id): no \(Designs.index(of: id).path)"
+                    // An existing _smoke/index.html must not read as missing: _ folders are skipped on purpose.
+                    let why = id.hasPrefix("_") ? "folders starting with _ are not designs"
+                        : !Designs.isValidID(id) ? "not a design folder name"
+                        : "no \(Designs.index(of: id).path)"
+                    throw UsageError(description: "--design \(id): \(why)"
                         + " (designs: \(known.isEmpty ? "none" : known.joined(separator: ", ")))")
                 }
                 options.design = id
@@ -161,7 +167,7 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
     private var window: NSWindow?
     private var webView: WKWebView?
     private var loadedAt: Date?
-    private var fixtureLines: [[String: Any]] = []
+    private var fixtureLines: [String] = []
     private var fixtureNext = 0
     private var fixtureTimer: Timer?
     private var activity: NSObjectProtocol?
@@ -254,7 +260,7 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
         // blocks replayed, and the run (data, snapshot clock) carries on.
         if loadedAt != nil {
             if let line = replay.line {
-                say("page reloaded; replayed \(ReplayCache.keys.filter { replay.blocks[$0] != nil }.joined(separator: ", "))")
+                say("page reloaded; replayed \(replay.held)")
                 push(line)
             } else {
                 say("page reloaded; nothing to replay yet")
@@ -299,7 +305,7 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
             RunLoop.main.add(timer, forMode: .common)
             fixtureTimer = timer
         } else {
-            feed.onJSON = { [weak self] json in self?.push(json) }
+            feed.onLine = { [weak self] line in self?.push(line) }
             feed.start()
         }
     }
@@ -309,11 +315,11 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
         fixtureNext = (fixtureNext + 1) % fixtureLines.count
     }
 
-    private func push(_ json: [String: Any]) {
+    private func push(_ line: String) {
         guard let webView else { return }
-        replay.note(json)
+        replay.note(line)
         pushed += 1
-        KilnWall.send(json, to: webView) { [weak self] error in
+        KilnWall.send(line, to: webView) { [weak self] error in
             guard let self else { return }
             scriptErrors += 1
             if scriptErrors <= 3 { say("page script error #\(scriptErrors): \(error.localizedDescription)") }
@@ -328,11 +334,12 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
         for (number, line) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty { continue }
-            guard let object = (try? JSONSerialization.jsonObject(with: Data(trimmed.utf8))) as? [String: Any] else {
+            // Checked once here; sent as text, like the feed's lines.
+            guard (try? JSONSerialization.jsonObject(with: Data(trimmed.utf8))) is [String: Any] else {
                 say("fixture line \(number + 1) is not a JSON object; skipped")
                 continue
             }
-            fixtureLines.append(object)
+            fixtureLines.append(trimmed)
         }
         if fixtureLines.isEmpty {
             fail("the fixture \(path) has no JSON object lines")

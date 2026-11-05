@@ -168,19 +168,69 @@ struct PageTarget: Equatable {
     }
 }
 
-// kiln-feed sends `analytics`, `github` and `hist` only on lines where they changed. A page that
-// loads after such a line (launch race, live reload, design switch, WebContent restart) gets the
-// last of each replayed as one line: {"replay": true, ...}.
+// kiln-feed sends the top-level `analytics`, `github`, `hist` and `weather`, and `claude.events`,
+// `claude.limits` and `claude.tokens`, only on lines where they changed. A page that loads after
+// such a line (launch race, live reload, design switch, WebContent restart) gets the last of each
+// replayed as one line: {"replay": true, "analytics": ..., "claude": {"events": ...}, ...}, with
+// only the blocks seen so far.
+//
+// Lines go to the page as raw text, so this is the only place the host reads one. It parses only
+// a line that names one of the keys (`"<key>":`, as kiln-feed's compact json.dumps writes it):
+// measured 2026-11-04 on 148 real lines at 100 ms (median 5.4 KB), the byte scan costs 4.5 µs a
+// line against 60 µs for JSONSerialization, and 17 of the 148 named a key (all of them for real).
+// A key named elsewhere in a line only costs a parse; the blocks are read from where they belong.
 struct ReplayCache {
-    static let keys = ["analytics", "github", "hist"]
-    private(set) var blocks: [String: Any] = [:]
+    static let topKeys = ["analytics", "github", "hist", "weather"]
+    static let claudeKeys = ["events", "limits", "tokens"]
+    private static let patterns: [[UInt8]] = (topKeys + claudeKeys).map { Array("\($0)\":".utf8) }
 
-    mutating func note(_ json: [String: Any]) {
-        for key in Self.keys { if let value = json[key] { blocks[key] = value } }
+    private var top: [String: Any] = [:]
+    private var claude: [String: Any] = [:]
+
+    // What a replay would carry, for the logs: "analytics, ..., claude.events, ...".
+    var held: String {
+        (Self.topKeys.filter { top[$0] != nil } + Self.claudeKeys.filter { claude[$0] != nil }.map { "claude." + $0 })
+            .joined(separator: ", ")
     }
 
-    var line: [String: Any]? {
-        blocks.isEmpty ? nil : blocks.merging(["replay": true]) { kept, _ in kept }
+    mutating func note(_ line: String) {
+        guard Self.namesAKey(line),
+              let json = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]
+        else { return }
+        for key in Self.topKeys { if let value = json[key] { top[key] = value } }
+        if let inner = json["claude"] as? [String: Any] {
+            for key in Self.claudeKeys { if let value = inner[key] { claude[key] = value } }
+        }
+    }
+
+    var line: String? {
+        if top.isEmpty, claude.isEmpty { return nil }
+        var object = top
+        if !claude.isEmpty { object["claude"] = claude }
+        object["replay"] = true
+        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return nil }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    // Whether a `"` in the line opens one of `"<key>":`.
+    static func namesAKey(_ line: String) -> Bool {
+        var line = line
+        return line.withUTF8 { bytes in
+            let n = bytes.count
+            var i = 0
+            while i < n {
+                if bytes[i] == 0x22 {
+                    let start = i + 1
+                    for pattern in patterns where start + pattern.count <= n && bytes[start] == pattern[0] {
+                        var j = 1
+                        while j < pattern.count, bytes[start + j] == pattern[j] { j += 1 }
+                        if j == pattern.count { return true }
+                    }
+                }
+                i += 1
+            }
+            return false
+        }
     }
 }
 

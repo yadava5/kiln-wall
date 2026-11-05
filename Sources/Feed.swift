@@ -1,5 +1,6 @@
 // The data feed: kiln-feed.py as a child process, one JSON object per stdout line, or a built-in
 // stub while that script does not exist. Started and stopped by KilnWall as visibility changes.
+// Lines are passed on as text, unparsed: the page parses them (see KilnWall.send).
 // The child's stdin is a pipe: `period <ms>\n` on it changes the period live (no restart), and
 // closing it (EOF) ends the child.
 import Foundation
@@ -14,7 +15,7 @@ final class Feed {
     // A child that ran this long before exiting is treated as healthy: the backoff starts over.
     private static let healthyRun: TimeInterval = 60
 
-    var onJSON: (([String: Any]) -> Void)?
+    var onLine: ((String) -> Void)?
 
     // A parameter only so the child-process path can be exercised against a test script.
     private let script: String
@@ -115,9 +116,9 @@ final class Feed {
         let current = generation
         lines = 0
         let stdoutLines = LineReader { [weak self] line in
-            let object = try? JSONSerialization.jsonObject(with: line)
+            let text = Self.looksLikeObject(line) ? String(decoding: line, as: UTF8.self) : nil
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.received(object, bytes: line.count, from: current) }
+                MainActor.assumeIsolated { self?.received(text, bytes: line.count, from: current) }
             }
         }
         let stderrLines = LineReader { line in
@@ -152,15 +153,23 @@ final class Feed {
         }
     }
 
-    private func received(_ object: Any?, bytes: Int, from source: Int) {
+    // Only a cheap shape check ({ ... }, so not a traceback or a stray print): the page parses the
+    // line and ignores one that is not JSON.
+    nonisolated static func looksLikeObject(_ line: Data) -> Bool {
+        let blank: Set<UInt8> = [0x20, 0x09, 0x0D]
+        return line.first { !blank.contains($0) } == UInt8(ascii: "{")
+            && line.last { !blank.contains($0) } == UInt8(ascii: "}")
+    }
+
+    private func received(_ line: String?, bytes: Int, from source: Int) {
         guard source == generation, wanted else { return }
-        guard let json = object as? [String: Any] else {
+        guard let line else {
             log("feed: skipped a line that is not a JSON object (\(bytes) bytes)")
             return
         }
         lines += 1
         if lines == 1 || lines % 60 == 0 { log("feed: line \(lines) from kiln-feed.py, \(bytes) bytes") }
-        onJSON?(json)
+        onLine?(line)
     }
 
     private func exited(status: Int32, signalled: Bool, from source: Int) {
@@ -227,7 +236,9 @@ final class Feed {
 
     private func emitStub() {
         let now = (Date().timeIntervalSince1970 * 1000).rounded() / 1000
-        onJSON?(["v": 1, "t": now, "stub": true, "feed": ["period_ms": periodMs]])
+        let object: [String: Any] = ["v": 1, "t": now, "stub": true, "feed": ["period_ms": periodMs]]
+        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return }
+        onLine?(String(decoding: data, as: UTF8.self))
     }
 
     private func retryReal() {
