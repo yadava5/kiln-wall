@@ -10,14 +10,21 @@
 // since the last; and once at once, past that throttle, when a new design or appearance has
 // painted, also while covered (main.swift draws it unseen for this).
 //
-// Every picture is tagged with what it shows, its Look (design and appearance), in its file name,
-// and is only ever shown as that look: Ayush saw the previous design for "a second or two" on
+// Every picture is tagged with what it shows, its Look (design and the light or dark look it was
+// drawn in), in its file name, and is only ever shown as that look: Ayush saw the previous design for "a second or two" on
 // returning to the desktop after switching designs (2026-11-05). The host log had it: the desktop
 // picture stayed the old design for 168 s after a switch (the after-load snapshot fell under a
 // cover), and the overlay over a returning page was "the newest JPEG", of the old design. A
 // snapshot is checked against the page when it completes and again before it is set: a page
 // that changed meanwhile drops it. Until a picture of a new look exists, the desktop picture is
 // the newest older picture of that look, else a plain field of the design's background colour.
+//
+// The tag is the look as drawn, light or dark, not the menu's choice: "auto" is the design's own
+// sun rule, so a picture tagged "auto" said nothing about what it showed, and at 12:31 on
+// 2026-11-05 a return found no picture of glass/auto although glass/dark, what auto was showing,
+// had one. A forced choice is its own look; an "auto" snapshot is read from its pixels (luma mean
+// over 48x30 at or above lightLumaMean: light). main.swift matches "auto" to the look the page
+// was last seen to draw it in.
 //
 // Each snapshot goes to a new file in ~/Library/Application Support/KilnWall/desktop/ (macOS
 // caches the picture by URL, so a rewritten file would not be re-read). Kept per display: the
@@ -33,17 +40,20 @@ import ImageIO
 import UniformTypeIdentifiers
 import WebKit
 
-// What a picture shows: the design (its folder id, or "_page" for the old page folder or the
-// bundled page; a design id never starts with "_") and the appearance the page was told.
+// A design (its folder id, or "_page" for the old page folder or the bundled page; a design id
+// never starts with "_") and an appearance. For the page: what it is told (auto, light or dark).
+// For a picture: the look it shows, light or dark only.
 struct Look: Hashable, CustomStringConvertible {
     let design: String
     let appearance: String
     var description: String { "\(design)/\(appearance)" }
+    var isAuto: Bool { appearance == Appearance.auto.rawValue }
 }
 
-// One file of the desktop folder: desktop-<display>-<ms>@<design>@<appearance>[@solid].jpg, the
+// One file of the desktop folder: desktop-<display>-<ms>@<design>@<light|dark>[@solid].jpg, the
 // design percent-encoded so "@" only separates fields. A file from before the tags
-// (desktop-<display>-<ms>.jpg) has no look and is never shown.
+// (desktop-<display>-<ms>.jpg), or tagged "auto" (before 2026-11-05 13:00), has no look and is
+// never shown.
 struct DesktopPicture {
     let url: URL
     let ms: Int
@@ -65,7 +75,8 @@ struct DesktopPicture {
         guard let ms = Int(fields[0]) else { return nil }
         url = folder.appendingPathComponent(name)
         self.ms = ms
-        if fields.count >= 3, let design = fields[1].removingPercentEncoding, !design.isEmpty, !fields[2].isEmpty {
+        if fields.count >= 3, let design = fields[1].removingPercentEncoding, !design.isEmpty,
+           fields[2] == Appearance.light.rawValue || fields[2] == Appearance.dark.rawValue {
             look = Look(design: design, appearance: fields[2])
         } else {
             look = nil
@@ -81,10 +92,17 @@ final class DesktopMatcher {
     nonisolated private static let quality = 0.9
     // A snapshot whose luma varies less than this is a blank page: never written or set.
     nonisolated static let blankLumaStd = 3.0
+    // An "auto" snapshot whose luma mean is at least this shows the light look. Measured
+    // 2026-11-05 ~13:00 (daytime), headless at 1x, every design forced each way: dark 28.4
+    // (flightdeck, its day sky under the dark scrims) to 47.0 (horizon), light 194-224 (glass
+    // 195.7, flightdeck 204.4, ledger 209.6, horizon 215.7, missionmap 216.4, bento 224.4), and
+    // auto within 1.3 of light for all six.
+    nonisolated static let lightLumaMean = 120.0
     private static let snapshotTimeout: TimeInterval = 10
 
-    // A snapshot asked for: a picture of `look`, good only while `isCurrent()` says the page still
-    // shows it. `completion` gets the file written (whether or not it was set), or nil.
+    // A snapshot asked for: a picture of the page told `look` (auto, light or dark), good only
+    // while `isCurrent()` says the page still shows it. The file is tagged with the light or dark
+    // look it shows. `completion` gets the file written (whether or not it was set), or nil.
     struct Request {
         let reason: String
         let look: Look
@@ -164,16 +182,19 @@ final class DesktopMatcher {
                 log(String(format: "desktop: snapshot display %u of %@ (%@): %dx%d px in %.1f ms, WebContent CPU %@",
                            display, look.description, reason, cgImage.width, cgImage.height, snapshotMs,
                            webCPU.map { String(format: "%.1f ms", $0) } ?? "unknown"))
-                let url = Self.folder.appendingPathComponent(DesktopPicture.name(display, look, solid: false))
                 let spare = self.lastSet[display]
                 self.encoder.async {
                     let encodeStarted = DispatchTime.now().uptimeNanoseconds
-                    let result: Result<(Int, Bool), Problem>
-                    if let stats = Self.lumaStats(cgImage), stats.std < Self.blankLumaStd {
+                    let result: Result<(url: URL, shown: Look, how: String, bytes: Int, redrawn: Bool), Problem>
+                    let stats = Self.lumaStats(cgImage)
+                    if let stats, stats.std < Self.blankLumaStd {
                         result = .failure(Problem(message: String(
                             format: "snapshot of %@ refused: blank (luma mean %.1f std %.1f)", look.description, stats.mean, stats.std)))
+                    } else if let (shown, how) = Self.shownLook(look, stats) {
+                        let url = Self.folder.appendingPathComponent(DesktopPicture.name(display, shown, solid: false))
+                        result = Self.write(cgImage, width: width, height: height, to: url).map { (url, shown, how, $0.0, $0.1) }
                     } else {
-                        result = Self.write(cgImage, width: width, height: height, to: url)
+                        result = .failure(Problem(message: "snapshot of \(look) not written: its luma, which tells auto's look, is unknown"))
                     }
                     let encodeMs = Self.ms(since: encodeStarted)
                     if case .success = result { Self.prune(display, sparing: spare) }
@@ -181,10 +202,12 @@ final class DesktopMatcher {
                         MainActor.assumeIsolated {
                             guard self.inFlight[display] == token else { return }
                             switch result {
-                            case .success(let (bytes, redrawn)):
+                            case .success(let written):
+                                let url = written.url
                                 if request.isCurrent() {
-                                    self.set(display, url, look: look, reason: reason, detail: String(
-                                        format: "%d bytes; JPEG encode + write %.1f ms%@", bytes, encodeMs, redrawn ? " (redrawn to fit)" : ""))
+                                    self.set(display, url, look: written.shown, reason: reason, detail: String(
+                                        format: "%@; %d bytes; JPEG encode + write %.1f ms%@", written.how, written.bytes, encodeMs,
+                                        written.redrawn ? " (redrawn to fit)" : ""))
                                 } else {
                                     log("desktop: display \(display) wrote \(url.lastPathComponent) but did not set it: the page changed meanwhile (\(reason))")
                                 }
@@ -398,6 +421,16 @@ final class DesktopMatcher {
                        intent: image.renderingIntent)
     }
 
+    // The look a snapshot of a page told `told` shows: a forced light or dark is itself; "auto"
+    // is read from the snapshot's luma mean (lightLumaMean). Nil: auto with no luma.
+    nonisolated private static func shownLook(_ told: Look, _ stats: (mean: Double, std: Double)?) -> (Look, String)? {
+        guard told.isAuto else { return (told, "\(told.appearance), as chosen") }
+        guard let stats else { return nil }
+        let light = stats.mean >= lightLumaMean
+        return (Look(design: told.design, appearance: (light ? Appearance.light : .dark).rawValue),
+                String(format: "auto drawn %@ (luma mean %.1f %@ %.0f)", light ? "light" : "dark", stats.mean, light ? ">=" : "<", lightLumaMean))
+    }
+
     // Luma over a 48x30 grid: a populated page has a std of ~20 (glass), a blank one under 3.
     nonisolated static func lumaStats(_ image: CGImage) -> (mean: Double, std: Double)? {
         let width = 48, height = 30
@@ -437,6 +470,11 @@ final class DesktopMatcher {
     // a page that reloads or returns, and the desktop picture until a fresh one is taken.
     nonisolated static func newestPicture(_ display: CGDirectDisplayID, of look: Look) -> DesktopPicture? {
         pictures(display).last { !$0.solid && $0.look == look }
+    }
+
+    // This display's newest picture of `design` in either look (never a solid).
+    nonisolated static func newestPicture(_ display: CGDirectDisplayID, design: String) -> DesktopPicture? {
+        pictures(display).last { !$0.solid && $0.look?.design == design }
     }
 
     // The newest picture of each design (any appearance), for the menu's design pictures.

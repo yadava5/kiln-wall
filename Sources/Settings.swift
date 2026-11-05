@@ -362,8 +362,9 @@ struct ReplayCache {
 
     // The latest complete state as a normal line, and its `t` (for the logs). Without a last line
     // yet (or one that does not parse), the replay line. Parses and re-encodes one line: only on a
-    // page load or an uncover, never per line.
-    func latest() -> (line: String, t: Double?)? {
+    // page load, an uncover or a save (LastLine), never per line. `cached`: marked `"cached": true`,
+    // which kiln-runtime.js renders in full and marks the page stale until a live line arrives.
+    func latest(cached: Bool = false) -> (line: String, t: Double?)? {
         guard let last,
               var object = (try? JSONSerialization.jsonObject(with: Data(last.utf8))) as? [String: Any]
         else { return line.map { ($0, nil) } }
@@ -373,6 +374,7 @@ struct ReplayCache {
             for (key, value) in claude where inner[key] == nil { inner[key] = value }
             object["claude"] = inner
         }
+        object["cached"] = cached ? true : nil
         guard let data = try? JSONSerialization.data(withJSONObject: object) else { return (last, nil) }
         return (String(decoding: data, as: UTF8.self), (object["t"] as? NSNumber)?.doubleValue)
     }
@@ -395,6 +397,50 @@ struct ReplayCache {
                 i += 1
             }
             return false
+        }
+    }
+}
+
+// The last full state on disk, ~/Library/Application Support/KilnWall/last-line.json: the merged
+// latest line (ReplayCache.latest, so analytics, github, hist and the rest are in it). Read once
+// at launch into the replay cache, so every page load, even the first, under a cover and with no
+// feed running, is sent a whole line (marked cached) and draws real, stale figures at once instead
+// of an empty layout (Ayush, 2026-11-05: "It can be stale ... but it should not be blank"). Written
+// atomically, at most every `every` seconds while lines arrive, when the wallpaper pauses, when
+// the covered grace ends and at quit.
+enum LastLine {
+    static let file = KilnSupport.folder.appendingPathComponent("last-line.json")
+    static let every: TimeInterval = 30
+    private static let writer = DispatchQueue(label: "io.github.yadava5.kilnwall.last-line", qos: .utility)
+
+    // The saved line, if it is a JSON object with a time (a full feed line, not a replay line).
+    static func read() -> (line: String, t: Double)? {
+        guard let data = try? Data(contentsOf: file),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              object["replay"] == nil, let t = (object["t"] as? NSNumber)?.doubleValue
+        else { return nil }
+        return (String(decoding: data, as: UTF8.self), t)
+    }
+
+    // Off the main thread, or at once (`now`, at quit). `failed` gets the error's text, on main.
+    static func write(_ line: String, now: Bool, failed: @escaping @MainActor (String) -> Void) {
+        let data = Data(line.utf8)
+        let save: @Sendable () -> String? = {
+            do {
+                try FileManager.default.createDirectory(at: KilnSupport.folder, withIntermediateDirectories: true)
+                try data.write(to: file, options: .atomic)
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
+        }
+        if now {
+            if let problem = save() { MainActor.assumeIsolated { failed(problem) } }
+            return
+        }
+        writer.async {
+            guard let problem = save() else { return }
+            DispatchQueue.main.async { MainActor.assumeIsolated { failed(problem) } }
         }
     }
 }
