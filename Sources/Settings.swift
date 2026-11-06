@@ -255,6 +255,16 @@ enum Designs {
         isValidID(id) && FileManager.default.fileExists(atPath: index(of: id, in: root).path)
     }
 
+    // Whether a design has a day and a night look (designs/README.md, Preferences): design.json
+    // may say with "looks": 2; without the key, the three the README names. A one-look design
+    // ignores Kiln.appearance, so the menu dims its Appearance control for it.
+    static func hasTwoLooks(_ id: String, in root: URL = root) -> Bool {
+        let meta = (try? Data(contentsOf: root.appendingPathComponent(id).appendingPathComponent("design.json")))
+            .flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } ?? [:]
+        if let looks = (meta["looks"] as? NSNumber)?.intValue { return looks >= 2 }
+        return ["glass", "bento", "ledger"].contains(id)
+    }
+
     // Sorted by design.json "order" (none: last), then id.
     static func list(in root: URL = root) -> [Design] {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []

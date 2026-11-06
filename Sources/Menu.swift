@@ -1,38 +1,59 @@
-// The menu-bar menu. main.swift owns the state and the actions; this builds the menu, keeps it
-// current while it is open, and draws its own rows: the status header on Liquid Glass, the
-// refresh-period slider, the design grid, the appearance control and the two switches. The rest
-// are native items, the temperature unit's submenu among them.
+// The menu-bar menu, laid out like Control Center: a grid of rounded tiles, each one kind of
+// control, with as little text as the controls can stand. main.swift owns the state and the
+// actions; this builds the menu, keeps it current while it is open, and draws every tile itself.
+// The only native item is the footer's, which carries Quit's ⌘Q.
 //
-// The custom rows line up with the native ones by AppKit's own numbers, measured offscreen from
-// its menu item views on macOS 26.6 (tools/menu-render renders the whole menu that way,
-// light and dark): items 24 pt high; with no item showing a checkmark, symbols in a 16 pt
-// column at x 16 (13 pt, scale .small), titles at x 36, section headers at x 14 in 11 pt
-// semibold, separators and key equivalents ending 16 pt from the right; the selection is inset
-// 5 pt from each side. A text field draws its glyphs 2 pt inside its frame, so a label framed
-// at x 36 starts where a native title does.
+// The grid: 308 pt wide, tiles 10 pt from the menu's edge (its own 5 pt padding plus 5), 8 pt
+// gutters, two columns of 140 or four of 66. Every tile has the same 14 pt corner; what sits
+// 8 pt inside a tile has a 6 pt one, so the corners stay concentric. Tiles are flat fills over
+// the menu's own material (Liquid Glass on macOS 26), the way Control Center's modules sit on
+// its panel; tools/menu-render paints the material's stand-in and renders the rest as is.
 import AppKit
 import ImageIO
 import UniformTypeIdentifiers
 
 enum MenuMetrics {
     static let width: CGFloat = 308
-    static let edge: CGFloat = 16  // separators, the symbol column's left, trailing content's right
-    static let iconWidth: CGFloat = 16
-    static let titleX: CGFloat = 36
-    static let headerX: CGFloat = 14
-    static let selectionInset: CGFloat = 5
-    static let row: CGFloat = 24
-    static let symbol = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular, scale: .small)
-    static let titleFont = NSFont.menuFont(ofSize: 0)
-    static let headerFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
+    static let edge: CGFloat = 10
+    static let gap: CGFloat = 8
+    static let content = width - 2 * edge  // 288
+    static let half = (content - gap) / 2  // 140
+    static let quarter = (content - 3 * gap) / 4  // 66
+    static let tileRadius: CGFloat = 14
+    static let innerRadius: CGFloat = 6
+    static let inset: CGFloat = 8  // a tile's padding
+    static let symbol = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium, scale: .small)
+    static let titleFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
+    static let labelFont = NSFont.systemFont(ofSize: 11, weight: .medium)
     static let smallFont = NSFont.systemFont(ofSize: 11)
-    // Secondary text. secondaryLabelColor measured too faint for 11 pt on the menu (2026-11-05,
-    // palmath over #F6F6F6 / #2C2C2E and the card a shade off): WCAG 3.89 in light, APCA Lc 46
-    // in dark. These give 5.6:1 / Lc 75 in light and 6.4:1 / Lc 63 in dark, still a clear step
-    // below the titles.
-    static let dimText = NSColor(name: "KilnMenuDim") { appearance in
-        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-            ? NSColor(white: 1, alpha: 0.70) : NSColor(white: 0, alpha: 0.60)
+    static let valueFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+
+    // Measured with palmath (2026-11-05) over the tiles as menu-render paints them, light
+    // #EAEAEA (black 0.05 on #F6F6F6) and dark #414143 (white 0.10 on #2C2C2E): the dim text is
+    // 5.0:1 / APCA Lc 70 in light and 6.3:1 / Lc 62 in dark, a step under the titles' 13:1.
+    static let dimText = dynamic(dark: NSColor(white: 1, alpha: 0.70), light: NSColor(white: 0, alpha: 0.60))
+    static let tileFill = dynamic(dark: NSColor(white: 1, alpha: 0.10), light: NSColor(white: 0, alpha: 0.05))
+    static let tileHover = dynamic(dark: NSColor(white: 1, alpha: 0.15), light: NSColor(white: 0, alpha: 0.085))
+    static let tilePressed = dynamic(dark: NSColor(white: 1, alpha: 0.20), light: NSColor(white: 0, alpha: 0.13))
+    // The chosen segment's pill and the slider's empty track, a step lighter than the tile.
+    static let pill = dynamic(dark: NSColor(white: 1, alpha: 0.18), light: NSColor(white: 1, alpha: 1))
+    static let track = dynamic(dark: NSColor(white: 1, alpha: 0.12), light: NSColor(white: 0, alpha: 0.10))
+    // A hairline that keeps a light shape's edge on a light menu.
+    static let hairline = dynamic(dark: NSColor(white: 1, alpha: 0.08), light: NSColor(white: 0, alpha: 0.08))
+
+    private static func dynamic(dark: NSColor, light: NSColor) -> NSColor {
+        NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
+        }
+    }
+
+    // Black or white, whichever reads better on `fill` in the current drawing appearance, by
+    // WCAG 2 contrast: white loses on the green, yellow and orange accents (2:1 on green).
+    static func ink(on fill: NSColor) -> NSColor {
+        guard let c = fill.usingColorSpace(.sRGB) else { return .white }
+        func linear(_ v: CGFloat) -> CGFloat { v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4) }
+        let l = 0.2126 * linear(c.redComponent) + 0.7152 * linear(c.greenComponent) + 0.0722 * linear(c.blueComponent)
+        return 1.05 / (l + 0.05) >= (l + 0.05) / 0.05 ? .white : .black
     }
 }
 
@@ -84,20 +105,23 @@ final class KilnMenu: NSObject, NSMenuDelegate {
     // Before each opening, e.g. to refresh the shown design's picture.
     var willOpen: () -> Void = {}
 
-    private let header = StatusHeaderView()
+    private let status = StatusTileView()
+    private let appearanceTile = SegmentTileView(label: "Appearance", items: [
+        .init(symbol: "circle.lefthalf.filled", label: "Auto", tip: "Auto: the day look by day, the night look after sunset"),
+        .init(symbol: "sun.max.fill", label: "Light", tip: "Light: the day look, always"),
+        .init(symbol: "moon.fill", label: "Dark", tip: "Dark: the night look, always"),
+    ])
+    private let unitTile = SegmentTileView(label: "Temperature unit", items: [
+        .init(text: "°F", label: "Fahrenheit", tip: "Fahrenheit"),
+        .init(text: "°C", label: "Celsius", tip: "Celsius"),
+    ])
     private let period: PeriodControlView
     private let grid = DesignGridView()
-    private let appearanceRow = AppearanceControlView()
-    // Temperature: a native submenu, the menu's own dropdown (a pop-up button inside a menu
-    // would be a menu tracking inside another), with the unit in use as the row's subtitle.
-    private let tempItem = NSMenuItem()
-    private let unitItems: [TempUnit: NSMenuItem] = Dictionary(uniqueKeysWithValues: TempUnit.allCases.map { unit in
-        (unit, NSMenuItem(title: unit.menuTitle, action: nil, keyEquivalent: ""))
-    })
-    private let matchRow = SwitchRowView(title: "Match macOS Wallpaper", symbol: "photo.on.rectangle")
-    private let loginRow = SwitchRowView(title: "Launch at Login", symbol: "power")
-    private let pauseItem = NSMenuItem()
-    private let showItem = NSMenuItem()
+    private let pauseTile = ToggleTileView(symbol: "pause.fill", title: "Pause", label: "Pause the wallpaper")
+    private let hideTile = ToggleTileView(symbol: "eye.slash.fill", title: "Hide", label: "Hide the wallpaper")
+    private let matchTile = ToggleTileView(symbol: "photo.fill.on.rectangle.fill", title: "Match", label: "Match the macOS wallpaper to the design",
+                                           tip: "Keep the macOS desktop picture matched to the live wallpaper")
+    private let loginTile = ToggleTileView(symbol: "power", title: "Login", label: "Launch at login", tip: "Launch KilnWall at login")
     private let gridItem = NSMenuItem()
     private var lastBeat = Date.distantPast
 
@@ -108,74 +132,54 @@ final class KilnMenu: NSObject, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
 
-        add(header)
-        menu.addItem(.separator())
-        menu.addItem(.sectionHeader(title: "Refresh"))
-        add(period)
-        menu.addItem(.separator())
-        menu.addItem(.sectionHeader(title: "Design"))
+        // Row 1: status beside appearance over unit. The menu pads 5 pt above the first row.
+        let top = RowView(height: 64, above: 5)
+        status.setFrameOrigin(NSPoint(x: MenuMetrics.edge, y: 0))
+        appearanceTile.setFrameOrigin(NSPoint(x: MenuMetrics.edge + MenuMetrics.half + MenuMetrics.gap, y: 36))
+        unitTile.setFrameOrigin(NSPoint(x: MenuMetrics.edge + MenuMetrics.half + MenuMetrics.gap, y: 0))
+        top.place(status, appearanceTile, unitTile)
+        add(top)
+        period.setFrameOrigin(NSPoint(x: MenuMetrics.edge, y: 0))
+        add(RowView(height: period.frame.height, above: MenuMetrics.gap).placing(period))
         gridItem.view = grid
         menu.addItem(gridItem)
-        menu.addItem(.separator())
-        menu.addItem(.sectionHeader(title: "Appearance"))
-        add(appearanceRow)
-        let units = NSMenu()
-        for unit in TempUnit.allCases {
-            let item = unitItems[unit]!
-            item.action = #selector(unitChosen(_:))
-            item.target = self
-            item.representedObject = unit.rawValue
-            units.addItem(item)
+        let toggles = RowView(height: MenuMetrics.quarter, above: MenuMetrics.gap)
+        for (i, tile) in [pauseTile, hideTile, matchTile, loginTile].enumerated() {
+            tile.setFrameOrigin(NSPoint(x: MenuMetrics.edge + CGFloat(i) * (MenuMetrics.quarter + MenuMetrics.gap), y: 0))
+            toggles.place(tile)
         }
-        tempItem.title = "Temperature"
-        tempItem.image = NSImage(systemSymbolName: "thermometer.medium", accessibilityDescription: nil)
-        tempItem.submenu = units
-        menu.addItem(tempItem)
-        menu.addItem(.separator())
-        configure(pauseItem, "Pause", "pause", #selector(pauseChosen))
-        configure(showItem, "Hide Wallpaper", "eye.slash", #selector(showChosen))
-        configure(NSMenuItem(), "Reload Page", "arrow.clockwise", #selector(reloadChosen))
-        configure(NSMenuItem(), "Open Page Folder", "folder", #selector(folderChosen))
-        menu.addItem(.separator())
-        add(matchRow)
-        add(loginRow)
-        menu.addItem(.separator())
-        // terminate: itself, so macOS 26 gives Quit its standard symbol.
-        let quit = menu.addItem(withTitle: "Quit KilnWall", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        add(toggles)
+        // The footer's item carries ⌘Q: a key equivalent fires through a custom view. terminate:
+        // itself, as the native Quit item had.
+        let footer = FooterView()
+        let quit = NSMenuItem(title: "Quit KilnWall", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
+        footer.setFrameOrigin(NSPoint(x: MenuMetrics.edge, y: 0))
+        quit.view = RowView(height: 24, above: MenuMetrics.gap, below: 5).placing(footer)
+        menu.addItem(quit)
 
         period.onChange = { [weak self] in self?.setPeriod($0) }
         period.onStep = { [weak self] in self?.stepPeriod($0) }
         grid.onChoose = { [weak self] in self?.chooseDesign($0) }
-        appearanceRow.onChange = { [weak self] in self?.setAppearance($0) }
-        matchRow.onToggle = { [weak self] in self?.setMatchDesktop($0) }
-        loginRow.onToggle = { [weak self] on in
+        grid.onPreview = { [weak self] in self?.status.preview = $0 }
+        appearanceTile.onChange = { [weak self] in self?.setAppearance(Appearance.allCases[$0]) }
+        unitTile.onChange = { [weak self] in self?.setTempUnit(TempUnit.allCases[$0]) }
+        pauseTile.onToggle = { [weak self] _ in self?.togglePause() }
+        hideTile.onToggle = { [weak self] _ in self?.toggleShown() }
+        matchTile.onToggle = { [weak self] in self?.setMatchDesktop($0) }
+        loginTile.onToggle = { [weak self] on in
             guard let self else { return }
-            let now = self.setLaunchAtLogin(on)
-            self.loginRow.isOn = now
+            self.loginTile.isOn = self.setLaunchAtLogin(on)
         }
+        footer.reload.onPress = { [weak self] in self?.reloadPage() }
+        footer.folder.onPress = { [weak self] in self?.openPageFolder() }
+        footer.quit.onPress = { NSApp.terminate(nil) }
     }
 
     private func add(_ view: NSView) {
         let item = NSMenuItem()
         item.view = view
         menu.addItem(item)
-    }
-
-    private func configure(_ item: NSMenuItem, _ title: String, _ symbol: String, _ action: Selector) {
-        item.title = title
-        item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-        item.action = action
-        item.target = self
-        menu.addItem(item)
-    }
-
-    @objc private func pauseChosen() { togglePause() }
-    @objc private func showChosen() { toggleShown() }
-    @objc private func reloadChosen() { reloadPage() }
-    @objc private func folderChosen() { openPageFolder() }
-    @objc private func unitChosen(_ sender: NSMenuItem) {
-        if let unit = (sender.representedObject as? String).flatMap(TempUnit.init(rawValue:)) { setTempUnit(unit) }
     }
 
     // MARK: Keeping it current
@@ -202,18 +206,19 @@ final class KilnMenu: NSObject, NSMenuDelegate {
     }
 
     private func refresh(_ now: MenuState) {
-        header.update(now)
+        status.update(now)
         period.update(periodMs: now.periodMs)
         grid.update(current: now.currentDesign)
-        appearanceRow.update(now.appearance)
-        for (unit, item) in unitItems { item.state = unit == now.tempUnit ? .on : .off }
-        if #available(macOS 14.4, *) { tempItem.subtitle = now.tempUnit.menuTitle }
-        matchRow.isOn = now.matchDesktop
-        loginRow.isOn = now.launchAtLogin
-        pauseItem.title = now.pausedByYou ? "Resume" : "Pause"
-        pauseItem.image = NSImage(systemSymbolName: now.pausedByYou ? "play" : "pause", accessibilityDescription: nil)
-        showItem.title = now.hidden ? "Show Wallpaper" : "Hide Wallpaper"
-        showItem.image = NSImage(systemSymbolName: now.hidden ? "eye" : "eye.slash", accessibilityDescription: nil)
+        appearanceTile.select(Appearance.allCases.firstIndex(of: now.appearance) ?? 0)
+        // One-look designs ignore the appearance (designs/README.md, Preferences): the control
+        // dims and says why, and stays where VoiceOver can read it.
+        let twoLooks = now.currentDesign.map { Designs.hasTwoLooks($0) } ?? false
+        appearanceTile.setEnabled(twoLooks, reason: twoLooks ? nil : "\(now.designName) has one look")
+        unitTile.select(TempUnit.allCases.firstIndex(of: now.tempUnit) ?? 0)
+        pauseTile.isOn = now.pausedByYou
+        hideTile.isOn = now.hidden
+        matchTile.isOn = now.matchDesktop
+        loginTile.isOn = now.launchAtLogin
     }
 
     // A line reached the page: the status light pulses, at most every 0.6 s so a 100 ms feed
@@ -221,54 +226,107 @@ final class KilnMenu: NSObject, NSMenuDelegate {
     func beat() {
         guard isOpen, Date().timeIntervalSince(lastBeat) >= 0.6 else { return }
         lastBeat = Date()
-        header.beat()
+        status.beat()
     }
 }
 
-// MARK: - Status header
+// MARK: - Rows and tiles
 
-// The design shown, the period, the state and the feed, on a Liquid Glass card inset like the
-// menu's own selection. The light sits in the symbol column and the text on the title column.
+// One menu item's view: the tiles of a row, with the gutter above them (and, for the last row,
+// the margin below) inside the item, since a menu item view has no margins of its own.
 @MainActor
-final class StatusHeaderView: NSView {
-    private static let cardHeight: CGFloat = 64
+final class RowView: NSView {
+    private let below: CGFloat
+
+    init(height: CGFloat, above: CGFloat, below: CGFloat = 0) {
+        self.below = below
+        super.init(frame: NSRect(x: 0, y: 0, width: MenuMetrics.width, height: height + above + below))
+    }
+
+    required init?(coder: NSCoder) { fatalError("not from a nib") }
+
+    // Each tile at its own x; y is the tile's, lifted over the margin below.
+    func place(_ views: NSView...) {
+        for view in views {
+            view.setFrameOrigin(NSPoint(x: view.frame.minX, y: view.frame.minY + below))
+            addSubview(view)
+        }
+    }
+
+    func placing(_ views: NSView...) -> RowView {
+        for view in views { place(view) }
+        return self
+    }
+}
+
+// A rounded tile. Interactive ones brighten under the pointer and darken while pressed; menus
+// never make the app active, so the tracking area must be active always.
+@MainActor
+class TileView: NSView {
+    var hovering = false { didSet { if hovering != oldValue { needsDisplay = true } } }
+    var pressed = false { didSet { if pressed != oldValue { needsDisplay = true } } }
+    var isInteractive: Bool { true }
+
+    var fillColour: NSColor {
+        !isInteractive ? MenuMetrics.tileFill : pressed ? MenuMetrics.tilePressed : hovering ? MenuMetrics.tileHover : MenuMetrics.tileFill
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("not from a nib") }
+
+    var shape: NSBezierPath { NSBezierPath(roundedRect: bounds, xRadius: MenuMetrics.tileRadius, yRadius: MenuMetrics.tileRadius) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        fillColour.setFill()
+        shape.fill()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        guard isInteractive else { return }
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovering = true }
+
+    override func mouseExited(with event: NSEvent) {
+        hovering = false
+        pressed = false
+    }
+}
+
+// MARK: - Status
+
+// The one place for live state: the light, the state in a word or two, and what is showing.
+// While a design in the grid is under the pointer, its name shows here instead, the way the
+// grid's own caption did. The feed's diagnostics are the tooltip and the VoiceOver text.
+@MainActor
+final class StatusTileView: TileView {
     private let light = StatusLight()
-    private let name = label(NSFont.systemFont(ofSize: 15, weight: .semibold), .labelColor)
-    private let period = label(NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .medium), MenuMetrics.dimText)
-    private let stateLine = label(NSFont.systemFont(ofSize: 11, weight: .medium), MenuMetrics.dimText)
-    private let feedLine = label(MenuMetrics.smallFont, MenuMetrics.dimText)
+    private let stateLine = label(NSFont.systemFont(ofSize: 12, weight: .semibold), .labelColor)
+    private let detail = label(MenuMetrics.smallFont, MenuMetrics.dimText)
+    private var shown = ""
+
+    var preview: String? { didSet { updateDetail() } }
+
+    override var isInteractive: Bool { false }
 
     init() {
-        let inset = MenuMetrics.selectionInset
-        super.init(frame: NSRect(x: 0, y: 0, width: MenuMetrics.width, height: Self.cardHeight + 4))
-        // The menu's 5 pt top padding above, 4 pt below: the card sits 5 pt from three edges.
-        let card = NSRect(x: inset, y: 4, width: MenuMetrics.width - 2 * inset, height: Self.cardHeight)
-        let content = NSView(frame: NSRect(origin: .zero, size: card.size))
-        if #available(macOS 26.0, *) {
-            let glass = NSGlassEffectView(frame: card)
-            glass.cornerRadius = 10
-            glass.contentView = content
-            addSubview(glass)
-        } else {
-            let plate = PlateView(frame: card)
-            plate.addSubview(content)
-            addSubview(plate)
-        }
-        // Card-local x: the menu's columns minus the card's inset.
-        let titleX = MenuMetrics.titleX - inset
-        let right = card.width - (MenuMetrics.edge - inset)
-        // Measured on the render: 10.5 pt from the card's top to the name's cap height and from
-        // the last baseline to its bottom. A right-aligned field ends 2 pt past its glyphs.
-        light.frame = NSRect(x: MenuMetrics.edge - inset - 4, y: 36, width: MenuMetrics.iconWidth + 8, height: 24)
-        name.frame = NSRect(x: titleX, y: 38, width: right - titleX - 64, height: 19)
-        name.lineBreakMode = .byTruncatingTail
-        period.frame = NSRect(x: right - 62, y: 39, width: 64, height: 16)
-        period.alignment = .right
-        stateLine.frame = NSRect(x: titleX, y: 22, width: right - titleX, height: 14)
+        super.init(frame: NSRect(x: 0, y: 0, width: MenuMetrics.half, height: 64))
+        let inset = MenuMetrics.inset
+        // Two lines centred in the tile, the light centred on the first. 12 pt so "Desktop
+        // covered" fits beside the light; the longer states truncate and read whole in the tooltip.
+        light.frame = NSRect(x: inset, y: 32, width: 20, height: 20)
+        stateLine.frame = NSRect(x: inset + 20, y: 33, width: bounds.width - inset - 20 - inset + 4, height: 17)
         stateLine.lineBreakMode = .byTruncatingTail
-        feedLine.frame = NSRect(x: titleX, y: 7, width: right - titleX, height: 14)
-        feedLine.lineBreakMode = .byTruncatingMiddle
-        for view in [light, name, period, stateLine, feedLine] as [NSView] { content.addSubview(view) }
+        detail.frame = NSRect(x: inset + 20, y: 15, width: stateLine.frame.width, height: 15)
+        detail.lineBreakMode = .byTruncatingMiddle
+        for view in [light, stateLine, detail] as [NSView] { addSubview(view) }
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
     }
@@ -276,24 +334,27 @@ final class StatusHeaderView: NSView {
     required init?(coder: NSCoder) { fatalError("not from a nib") }
 
     func update(_ state: MenuState) {
-        name.stringValue = state.designName
-        period.stringValue = "\(state.periodMs) ms"
         stateLine.stringValue = state.stateText
-        stateLine.toolTip = state.stateText
-        feedLine.stringValue = state.feedText
-        feedLine.toolTip = state.feedText
+        shown = state.designName
         light.state = state.light
-        setAccessibilityLabel("\(state.designName), every \(state.periodMs) ms. \(state.stateText). \(state.feedText)")
+        toolTip = "\(state.stateText). \(state.feedText)"
+        setAccessibilityLabel("\(state.stateText). Showing \(state.designName). \(state.feedText)")
+        updateDetail()
     }
 
     func beat() { light.beat() }
+
+    private func updateDetail() {
+        detail.stringValue = preview ?? shown
+        detail.textColor = preview == nil ? MenuMetrics.dimText : .labelColor
+    }
 }
 
 // Green running, grey under a cover (the feed held), orange paused for any other reason. The
 // state line beside it says which in words; the colour is never the only signal.
 @MainActor
 final class StatusLight: NSView {
-    private static let diameter: CGFloat = 8
+    private static let diameter: CGFloat = 10
     private let halo = CALayer()
 
     var state: MenuState.Light = .paused {
@@ -350,12 +411,154 @@ final class StatusLight: NSView {
     }
 }
 
-// Before macOS 26 (no Liquid Glass): a quiet rounded plate in place of the glass card.
+// MARK: - Segments
+
+// A capsule of equal segments, one chosen, the way iOS sets Light/Dark: the chosen one on a
+// pill, the rest dim until the pointer reaches them. Items are symbols or short text, never
+// both. Disabled, the tile fades and its tooltip says why; VoiceOver still reads it.
 @MainActor
-private final class PlateView: NSView {
+final class SegmentTileView: TileView {
+    struct Item {
+        var symbol: String? = nil
+        var text: String? = nil
+        let label: String
+        let tip: String
+    }
+
+    var onChange: (Int) -> Void = { _ in }
+    private(set) var selected = 0
+    private var enabled = true
+    private let segments: [SegmentView]
+    private static let pillInset: CGFloat = 3
+
+    override var isInteractive: Bool { false }
+
+    init(label: String, items: [Item]) {
+        segments = items.map(SegmentView.init)
+        super.init(frame: NSRect(x: 0, y: 0, width: MenuMetrics.half, height: 28))
+        let inner = bounds.insetBy(dx: Self.pillInset, dy: Self.pillInset)
+        let width = inner.width / CGFloat(segments.count)
+        for (i, segment) in segments.enumerated() {
+            segment.frame = NSRect(x: inner.minX + CGFloat(i) * width, y: inner.minY, width: width, height: inner.height)
+            segment.onChoose = { [weak self] in self?.choose(i) }
+            addSubview(segment)
+        }
+        setAccessibilityElement(true)
+        setAccessibilityRole(.radioGroup)
+        setAccessibilityLabel(label)
+        select(0)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not from a nib") }
+
+    func select(_ i: Int) {
+        guard segments.indices.contains(i) else { return }
+        selected = i
+        for (j, segment) in segments.enumerated() { segment.isChosen = j == i }
+        needsDisplay = true
+    }
+
+    func setEnabled(_ on: Bool, reason: String?) {
+        enabled = on
+        alphaValue = on ? 1 : 0.4
+        for segment in segments {
+            segment.isEnabled = on
+            segment.toolTip = on ? segment.item.tip : reason
+            segment.setAccessibilityEnabled(on)
+        }
+    }
+
+    private func choose(_ i: Int) {
+        guard enabled, i != selected else { return }
+        select(i)
+        onChange(i)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.quaternaryLabelColor.withAlphaComponent(0.08).setFill()
-        NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10).fill()
+        super.draw(dirtyRect)
+        guard segments.indices.contains(selected) else { return }
+        let pill = segments[selected].frame
+        let radius = pill.height / 2
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.12)
+        shadow.shadowBlurRadius = 2
+        shadow.shadowOffset = NSSize(width: 0, height: -0.5)
+        shadow.set()
+        MenuMetrics.pill.setFill()
+        NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius).fill()
+        NSGraphicsContext.restoreGraphicsState()
+        MenuMetrics.hairline.setStroke()
+        let edge = NSBezierPath(roundedRect: pill.insetBy(dx: 0.25, dy: 0.25), xRadius: radius, yRadius: radius)
+        edge.lineWidth = 0.5
+        edge.stroke()
+    }
+}
+
+@MainActor
+final class SegmentView: NSView {
+    let item: SegmentTileView.Item
+    var onChoose: () -> Void = {}
+    var isChosen = false { didSet { setAccessibilityValue(isChosen); tint() } }
+    var isEnabled = true
+    private var hovering = false { didSet { tint() } }
+    private let icon = NSImageView()
+    private let text = label(NSFont.systemFont(ofSize: 11, weight: .semibold), .labelColor)
+
+    init(_ item: SegmentTileView.Item) {
+        self.item = item
+        super.init(frame: .zero)
+        if let symbol = item.symbol {
+            icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: item.label)?
+                .withSymbolConfiguration(.init(pointSize: 12, weight: .medium, scale: .small))
+            icon.imageAlignment = .alignCenter
+            addSubview(icon)
+        } else {
+            text.stringValue = item.text ?? ""
+            text.alignment = .center
+            addSubview(text)
+        }
+        toolTip = item.tip
+        setAccessibilityElement(true)
+        setAccessibilityRole(.radioButton)
+        setAccessibilityLabel(item.label)
+        setAccessibilityValue(false)
+        tint()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not from a nib") }
+
+    override func layout() {
+        super.layout()
+        icon.frame = bounds
+        text.frame = NSRect(x: 0, y: (bounds.height - 15) / 2, width: bounds.width, height: 15)
+    }
+
+    private func tint() {
+        let colour: NSColor = isChosen || hovering ? .labelColor : MenuMetrics.dimText
+        icon.contentTintColor = colour
+        text.textColor = colour
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovering = isEnabled }
+    override func mouseExited(with event: NSEvent) { hovering = false }
+    override func mouseDown(with event: NSEvent) {}
+
+    override func mouseUp(with event: NSEvent) {
+        guard isEnabled, bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
+        onChoose()
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        guard isEnabled else { return false }
+        onChoose()
+        return true
     }
 }
 
@@ -363,106 +566,200 @@ private final class PlateView: NSView {
 
 // Left is slower, right is faster, as ⌃⌥- and ⌃⌥= move it (like btop, "+" is faster): the
 // tortoise end is 1000 ms, the hare end 100 ms. Ten stops; every stop the slider passes is
-// applied at once, through the same path as the hotkeys. The period itself reads in the header
-// just above, so this row carries only the keys.
+// applied at once, through the same path as the hotkeys. The period reads at the right as the
+// slider's value; the keys live in the tortoise's and the hare's tooltips.
 @MainActor
-final class PeriodControlView: NSView {
+final class PeriodControlView: TileView {
     var onChange: (Int) -> Void = { _ in }
     var onStep: (Int) -> Void = { _ in }
 
     private let min: Int, max: Int, step: Int
-    private let slider = NSSlider()
-    private let slower = SymbolButton(symbol: "tortoise", label: "Slower")
-    private let faster = SymbolButton(symbol: "hare", label: "Faster")
-    private let slowerKeys = label(MenuMetrics.smallFont, MenuMetrics.dimText)
-    private let fasterKeys = label(MenuMetrics.smallFont, MenuMetrics.dimText)
+    private let slider: StopSlider
+    private let slower = IconButton(symbol: "tortoise.fill", label: "Slower", tip: "Slower  ⌃⌥−")
+    private let faster = IconButton(symbol: "hare.fill", label: "Faster", tip: "Faster  ⌃⌥=")
+    private let value = label(MenuMetrics.valueFont, .labelColor)
     private var current = 0
+
+    override var isInteractive: Bool { false }
 
     init(min: Int, max: Int, step: Int) {
         self.min = min
         self.max = max
         self.step = step
-        super.init(frame: NSRect(x: 0, y: 0, width: MenuMetrics.width, height: 48))
-        let edge = MenuMetrics.edge, w = MenuMetrics.width, icon = MenuMetrics.iconWidth
-        slower.frame = NSRect(x: edge, y: 24, width: icon, height: 20)
-        faster.frame = NSRect(x: w - edge - icon, y: 24, width: icon, height: 20)
-        slider.frame = NSRect(x: edge + icon + 8, y: 24, width: w - 2 * (edge + icon + 8), height: 20)
-        slider.minValue = 0
-        slider.maxValue = Double(stops - 1)
-        slider.numberOfTickMarks = stops
-        slider.allowsTickMarkValuesOnly = true
-        slider.isContinuous = true
-        slider.target = self
-        slider.action = #selector(slid)
+        slider = StopSlider(stops: (max - min) / step + 1)
+        super.init(frame: NSRect(x: 0, y: 0, width: MenuMetrics.content, height: 48))
+        let inset = MenuMetrics.inset, w = bounds.width
+        slower.frame = NSRect(x: inset, y: 12, width: 24, height: 24)
+        value.frame = NSRect(x: w - inset - 46, y: 16, width: 48, height: 16)
+        value.alignment = .right
+        faster.frame = NSRect(x: value.frame.minX - 4 - 24, y: 12, width: 24, height: 24)
+        slider.frame = NSRect(x: slower.frame.maxX + 6, y: 6, width: faster.frame.minX - 6 - (slower.frame.maxX + 6), height: 36)
+        slider.onChange = { [weak self] in self?.slid($0) }
         slider.setAccessibilityLabel("Refresh period")
-        slower.target = self
-        slower.action = #selector(slowerChosen)
-        faster.target = self
-        faster.action = #selector(fasterChosen)
-        // Each hint starts under the button it matches.
-        slowerKeys.stringValue = "⌃⌥−  Slower"
-        fasterKeys.stringValue = "Faster  ⌃⌥="
-        slowerKeys.frame = NSRect(x: edge - 2, y: 6, width: 100, height: 14)
-        fasterKeys.frame = NSRect(x: w - edge - 98, y: 6, width: 100, height: 14)
-        fasterKeys.alignment = .right
-        slowerKeys.setAccessibilityLabel("Slower: Control Option Minus")
-        fasterKeys.setAccessibilityLabel("Faster: Control Option Equals")
-        for view in [slower, slider, faster, slowerKeys, fasterKeys] as [NSView] { addSubview(view) }
+        slower.onPress = { [weak self] in self?.onStep(step) }
+        faster.onPress = { [weak self] in self?.onStep(-step) }
+        for view in [slower, slider, faster, value] as [NSView] { addSubview(view) }
     }
 
     required init?(coder: NSCoder) { fatalError("not from a nib") }
 
-    private var stops: Int { (max - min) / step + 1 }
     private func ms(at stop: Int) -> Int { max - stop * step }
     private func stop(for ms: Int) -> Int { (max - ms) / step }
 
     func update(periodMs: Int) {
         current = periodMs
-        // Not while it is being dragged to this very stop: setting it would fight the drag.
-        if Int(slider.doubleValue.rounded()) != stop(for: periodMs) {
-            slider.doubleValue = Double(stop(for: periodMs))
-        }
-        slider.setAccessibilityValueDescription("\(periodMs) ms")
+        slider.value = stop(for: periodMs)
+        show(periodMs)
         slower.isEnabled = periodMs < max
         faster.isEnabled = periodMs > min
     }
 
-    @objc private func slid() {
-        let ms = ms(at: Int(slider.doubleValue.rounded()))
-        guard ms != current else { return }
-        current = ms
+    private func show(_ ms: Int) {
+        value.stringValue = "\(ms) ms"
         slider.setAccessibilityValueDescription("\(ms) ms")
-        onChange(ms)
     }
 
-    @objc private func slowerChosen() { onStep(step) }
-    @objc private func fasterChosen() { onStep(-step) }
+    private func slid(_ stop: Int) {
+        let ms = ms(at: stop)
+        guard ms != current else { return }
+        current = ms
+        show(ms)
+        onChange(ms)
+    }
 }
 
-// A borderless symbol button that brightens under the pointer. Menus never make the app active,
-// so the tracking area must be active always.
+// A thick capsule slider with a stop at each tick, like Control Center's display slider with
+// the thumb kept: the filled part is the accent, the knob white. Dragging snaps to the nearest
+// stop and reports each stop it reaches; VoiceOver steps it by one.
 @MainActor
-final class SymbolButton: NSButton {
-    private var hovering = false { didSet { tint() } }
+final class StopSlider: NSView {
+    var onChange: (Int) -> Void = { _ in }
+    let stops: Int
+    var value = 0 { didSet { if value != oldValue { needsDisplay = true } } }
 
-    init(symbol: String, label: String) {
+    private static let trackHeight: CGFloat = 18
+    private static let knob: CGFloat = 14
+
+    init(stops: Int) {
+        self.stops = Swift.max(stops, 2)
         super.init(frame: .zero)
-        image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)?
-            .withSymbolConfiguration(MenuMetrics.symbol)
-        imagePosition = .imageOnly
-        isBordered = false
-        bezelStyle = .regularSquare
-        setButtonType(.momentaryChange)
-        toolTip = label
+        setAccessibilityElement(true)
+        setAccessibilityRole(.slider)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not from a nib") }
+
+    private var track: NSRect {
+        NSRect(x: 0, y: (bounds.height - Self.trackHeight) / 2, width: bounds.width, height: Self.trackHeight)
+    }
+
+    // The knob's centre runs from half a track height in from each end.
+    private func x(of stop: Int) -> CGFloat {
+        let inset = Self.trackHeight / 2
+        return inset + (bounds.width - 2 * inset) * CGFloat(stop) / CGFloat(stops - 1)
+    }
+
+    private func stop(at x: CGFloat) -> Int {
+        let inset = Self.trackHeight / 2
+        let fraction = (x - inset) / (bounds.width - 2 * inset)
+        return Swift.min(stops - 1, Swift.max(0, Int((fraction * CGFloat(stops - 1)).rounded())))
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let track = track, r = Self.trackHeight / 2
+        MenuMetrics.track.setFill()
+        NSBezierPath(roundedRect: track, xRadius: r, yRadius: r).fill()
+        let knobX = x(of: value)
+        NSColor.controlAccentColor.setFill()
+        NSBezierPath(roundedRect: NSRect(x: track.minX, y: track.minY, width: knobX + r - track.minX, height: track.height),
+                     xRadius: r, yRadius: r).fill()
+        // A dot at each stop the knob is not on, so the stops read as stops.
+        for stop in 0 ..< stops where stop != value {
+            let filled = stop < value
+            (filled ? MenuMetrics.ink(on: .controlAccentColor).withAlphaComponent(0.45) : MenuMetrics.dimText.withAlphaComponent(0.4)).setFill()
+            NSBezierPath(ovalIn: NSRect(x: x(of: stop) - 1, y: track.midY - 1, width: 2, height: 2)).fill()
+        }
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.25)
+        shadow.shadowBlurRadius = 2
+        shadow.shadowOffset = NSSize(width: 0, height: -0.5)
+        shadow.set()
+        NSColor.white.setFill()
+        let k = Self.knob
+        NSBezierPath(ovalIn: NSRect(x: knobX - k / 2, y: track.midY - k / 2, width: k, height: k)).fill()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    private func set(_ stop: Int) {
+        guard stop != value else { return }
+        value = stop
+        onChange(stop)
+    }
+
+    // The drag is tracked here, the way a slider cell tracks it: a menu runs its own event loop,
+    // and this is the one path that is sure to see every drag event inside it.
+    override func mouseDown(with event: NSEvent) {
+        set(stop(at: convert(event.locationInWindow, from: nil).x))
+        guard let window else { return }
+        while let next = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            if next.type == .leftMouseUp { break }
+            set(stop(at: convert(next.locationInWindow, from: nil).x))
+        }
+    }
+
+    override func accessibilityPerformIncrement() -> Bool {
+        guard value < stops - 1 else { return false }
+        set(value + 1)
+        return true
+    }
+
+    override func accessibilityPerformDecrement() -> Bool {
+        guard value > 0 else { return false }
+        set(value - 1)
+        return true
+    }
+}
+
+// A round symbol button: dim until the pointer reaches it, a disc under it while hovered, and
+// nothing when disabled. Every one has a label for VoiceOver and a tooltip for the rest of us.
+@MainActor
+final class IconButton: NSView {
+    var onPress: () -> Void = {}
+    var isEnabled = true { didSet { tint() } }
+    private var hovering = false { didSet { tint() } }
+    private var pressed = false { didSet { needsDisplay = true } }
+    private let icon = NSImageView()
+
+    init(symbol: String, label: String, tip: String) {
+        super.init(frame: .zero)
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)?.withSymbolConfiguration(MenuMetrics.symbol)
+        icon.imageAlignment = .alignCenter
+        addSubview(icon)
+        toolTip = tip
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(label)
         tint()
     }
 
     required init?(coder: NSCoder) { fatalError("not from a nib") }
 
-    override var isEnabled: Bool { didSet { tint() } }
+    override func layout() {
+        super.layout()
+        icon.frame = bounds
+    }
 
     private func tint() {
-        contentTintColor = !isEnabled ? .tertiaryLabelColor : hovering ? .labelColor : MenuMetrics.dimText
+        icon.contentTintColor = !isEnabled ? .quaternaryLabelColor : hovering ? .labelColor : MenuMetrics.dimText
+        setAccessibilityEnabled(isEnabled)
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard isEnabled, hovering else { return }
+        (pressed ? MenuMetrics.tilePressed : MenuMetrics.tileHover).setFill()
+        NSBezierPath(ovalIn: bounds).fill()
     }
 
     override func updateTrackingAreas() {
@@ -472,100 +769,111 @@ final class SymbolButton: NSButton {
     }
 
     override func mouseEntered(with event: NSEvent) { hovering = true }
-    override func mouseExited(with event: NSEvent) { hovering = false }
+
+    override func mouseExited(with event: NSEvent) {
+        hovering = false
+        pressed = false
+    }
+
+    override func mouseDown(with event: NSEvent) { pressed = isEnabled }
+
+    override func mouseUp(with event: NSEvent) {
+        guard pressed else { return }
+        pressed = false
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { onPress() }
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        guard isEnabled else { return false }
+        onPress()
+        return true
+    }
 }
 
 // MARK: - Design grid
 
-// Each design as a picture of itself, three to a row, like the wallpaper grid in System
-// Settings: the one shown has the accent ring, the one under the pointer a quiet ring, and
-// the line below names whichever is under the pointer, else the one shown. Choosing one keeps
-// the menu open, so the wallpaper can be watched changing behind it.
+// Each design as a picture of itself, four to a row, like the wallpaper grid in System
+// Settings: the one shown has the accent ring, the one under the pointer a quiet ring, and the
+// status tile names whichever is under the pointer. Choosing one keeps the menu open, so the
+// wallpaper can be watched changing behind it.
 @MainActor
-final class DesignGridView: NSView {
-    static let columns = 3
-    static let gap: CGFloat = 12
-    private static let tileWidth = (MenuMetrics.width - 2 * MenuMetrics.edge - CGFloat(columns - 1) * gap) / CGFloat(columns)
+final class DesignGridView: TileView {
+    static let columns = 4
+    private static let thumbWidth = ((MenuMetrics.content - 2 * MenuMetrics.inset - CGFloat(columns - 1) * MenuMetrics.gap) / CGFloat(columns)).rounded(.down)
     // The aspect of the 1512 x 982 pt display the designs are drawn for.
-    private static let tileHeight = (tileWidth / 1.54).rounded()
+    private static let thumbHeight = (thumbWidth / 1.54).rounded()
 
     var onChoose: (String) -> Void = { _ in }
+    var onPreview: (String?) -> Void = { _ in }
 
     private var tiles: [DesignTileView] = []
-    private let caption = label(MenuMetrics.titleFont, MenuMetrics.dimText)
+    private let empty = label(MenuMetrics.smallFont, MenuMetrics.dimText)
     private var current: String?
-    private var hovered: DesignTileView? { didSet { updateCaption() } }
-    private var emptyText: String?
+
+    override var isInteractive: Bool { false }
 
     init() {
         super.init(frame: NSRect(x: 0, y: 0, width: MenuMetrics.width, height: 100))
-        caption.lineBreakMode = .byTruncatingMiddle
-        addSubview(caption)
+        empty.alignment = .center
+        empty.lineBreakMode = .byTruncatingMiddle
+        addSubview(empty)
     }
 
     required init?(coder: NSCoder) { fatalError("not from a nib") }
 
+    // The tile's own frame, inside the menu item's view this also is: the gutter above and the
+    // edges beside are part of the view, so the fill is drawn on the tile's rect only.
+    private var tile: NSRect {
+        NSRect(x: MenuMetrics.edge, y: 0, width: MenuMetrics.content, height: bounds.height - MenuMetrics.gap)
+    }
+
+    override var shape: NSBezierPath { NSBezierPath(roundedRect: tile, xRadius: MenuMetrics.tileRadius, yRadius: MenuMetrics.tileRadius) }
+
     func rebuild(_ designs: [MenuState.DesignEntry], current: String?, folder: String) {
         for tile in tiles { tile.removeFromSuperview() }
-        hovered = nil
+        onPreview(nil)
         tiles = designs.map { design in
             let tile = DesignTileView(design, picture: DesignPictures.image(design.id))
             tile.onChoose = { [weak self] in self?.onChoose($0) }
             tile.onHover = { [weak self, weak tile] inside in
                 guard let self, let tile else { return }
-                if inside { self.hovered = tile } else if self.hovered === tile { self.hovered = nil }
+                if inside { self.onPreview(tile.design.name) } else if self.tiles.contains(where: \.hovering) == false { self.onPreview(nil) }
             }
             return tile
         }
-        emptyText = designs.isEmpty ? "No designs in \(folder)" : nil
         let rows = (tiles.count + Self.columns - 1) / Self.columns
-        // 6 pt above the first row for its ring; the caption is one native row, its text 12 pt
-        // under the tiles like the rows' own gap.
-        let gridHeight = rows == 0 ? 0 : CGFloat(rows) * Self.tileHeight + CGFloat(rows - 1) * Self.gap + 6
-        let captionTop = rows == 0 ? 0 : gridHeight + 4
-        setFrameSize(NSSize(width: MenuMetrics.width, height: captionTop + MenuMetrics.row))
+        let inset = MenuMetrics.inset, gap = MenuMetrics.gap
+        let height = rows == 0 ? 40 : CGFloat(rows) * Self.thumbHeight + CGFloat(rows - 1) * gap + 2 * inset
+        setFrameSize(NSSize(width: MenuMetrics.width, height: height + gap))
         for (i, tile) in tiles.enumerated() {
             let row = i / Self.columns, column = i % Self.columns
-            let x = MenuMetrics.edge + CGFloat(column) * (Self.tileWidth + Self.gap)
-            let y = frame.height - 6 - CGFloat(row + 1) * Self.tileHeight - CGFloat(row) * Self.gap
-            tile.frame = NSRect(x: x, y: y, width: Self.tileWidth, height: Self.tileHeight)
+            let x = MenuMetrics.edge + inset + CGFloat(column) * (Self.thumbWidth + gap)
+            let y = height - inset - CGFloat(row + 1) * Self.thumbHeight - CGFloat(row) * gap
+            tile.frame = NSRect(x: x, y: y, width: Self.thumbWidth, height: Self.thumbHeight)
             addSubview(tile)
         }
-        caption.frame = NSRect(x: MenuMetrics.edge - 2, y: 4, width: MenuMetrics.width - 2 * MenuMetrics.edge + 4, height: 16)
+        empty.isHidden = !designs.isEmpty
+        empty.stringValue = designs.isEmpty ? "No designs in \(folder)" : ""
+        empty.frame = NSRect(x: MenuMetrics.edge + inset, y: (height - 15) / 2, width: MenuMetrics.content - 2 * inset, height: 15)
         update(current: current)
     }
 
     func update(current: String?) {
         self.current = current
         for tile in tiles { tile.isCurrent = tile.design.id == current }
-        updateCaption()
     }
 
     func clearHover() {
         for tile in tiles { tile.hovering = false }
-        hovered = nil
-    }
-
-    private func updateCaption() {
-        if let emptyText {
-            caption.stringValue = emptyText
-            caption.textColor = MenuMetrics.dimText
-        } else if let hovered {
-            let design = hovered.design
-            caption.stringValue = design.hasPage ? design.name : "\(design.name) (no index.html yet)"
-            caption.textColor = .labelColor
-        } else {
-            caption.stringValue = tiles.first { $0.design.id == current }?.design.name ?? ""
-            caption.textColor = MenuMetrics.dimText
-        }
+        onPreview(nil)
     }
 }
 
 @MainActor
 final class DesignTileView: NSView {
-    private static let radius: CGFloat = 6
-    private static let ringGap: CGFloat = 2
-    private static let ringWidth: CGFloat = 2.5
+    private static let radius = MenuMetrics.innerRadius
+    private static let ringGap: CGFloat = 1.5
+    private static let ringWidth: CGFloat = 2
 
     let design: MenuState.DesignEntry
     private let picture: NSImage?
@@ -600,10 +908,10 @@ final class DesignTileView: NSView {
             picture.draw(in: Self.aspectFill(picture.size, in: bounds), from: .zero, operation: .sourceOver,
                          fraction: design.hasPage ? 1 : 0.35)
         } else {
-            NSColor.quaternarySystemFill.setFill()
+            MenuMetrics.pill.setFill()
             bounds.fill()
             if let symbol = NSImage(systemSymbolName: "photo", accessibilityDescription: nil)?
-                .withSymbolConfiguration(.init(pointSize: 15, weight: .regular)) {
+                .withSymbolConfiguration(.init(pointSize: 13, weight: .regular)) {
                 let tinted = symbol.tinted(.tertiaryLabelColor)
                 let size = symbol.size
                 tinted.draw(in: NSRect(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2,
@@ -615,13 +923,13 @@ final class DesignTileView: NSView {
             bounds.fill()
         }
         NSGraphicsContext.restoreGraphicsState()
-        // A hairline so a dark picture keeps its edge on a dark menu.
-        NSColor.separatorColor.setStroke()
+        // A hairline so a dark picture keeps its edge on a dark tile.
+        MenuMetrics.hairline.setStroke()
         let edge = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.25, dy: 0.25), xRadius: Self.radius - 0.25, yRadius: Self.radius - 0.25)
         edge.lineWidth = 0.5
         edge.stroke()
 
-        let ringColour: NSColor? = isCurrent ? .controlAccentColor : (hovering && design.hasPage) ? .secondaryLabelColor : nil
+        let ringColour: NSColor? = isCurrent ? .controlAccentColor : (hovering && design.hasPage) ? MenuMetrics.dimText : nil
         if let ringColour {
             let offset = Self.ringGap + Self.ringWidth / 2
             let ring = NSBezierPath(roundedRect: bounds.insetBy(dx: -offset, dy: -offset),
@@ -673,126 +981,101 @@ final class DesignTileView: NSView {
     }
 }
 
-// MARK: - Appearance
+// MARK: - Toggles
 
-// Auto (the design's own day/night rule, which follows the sun), Light or Dark: one segmented
-// control across the content columns (16 pt from each edge, like the slider row's buttons), with
-// a line under it saying what the choice does, where the slider row has its key hints. Each
-// choice applies live and the menu stays open, so the wallpaper can be watched changing.
+// A setting as a Control Center tile: symbol above a one-word title, the accent filling it
+// while on. The ink on the accent is black or white by measured contrast (MenuMetrics.ink), so
+// a green or yellow accent stays readable. A click anywhere on the tile flips it.
 @MainActor
-final class AppearanceControlView: NSView {
-    var onChange: (Appearance) -> Void = { _ in }
-
-    private static let choices: [(appearance: Appearance, label: String, symbol: String, hint: String)] = [
-        (.auto, "Auto", "circle.lefthalf.filled", "Day look by day, night look after sunset"),
-        (.light, "Light", "sun.max", "The day look, always"),
-        (.dark, "Dark", "moon", "The night look, always"),
-    ]
-    private let control = NSSegmentedControl()
-    private let hint = label(MenuMetrics.smallFont, MenuMetrics.dimText)
-    private var current: Appearance?
-
-    init() {
-        super.init(frame: NSRect(x: 0, y: 0, width: MenuMetrics.width, height: 56))
-        let edge = MenuMetrics.edge, w = MenuMetrics.width
-        control.segmentCount = Self.choices.count
-        control.trackingMode = .selectOne
-        control.segmentDistribution = .fillEqually
-        for (i, choice) in Self.choices.enumerated() {
-            control.setImage(NSImage(systemSymbolName: choice.symbol, accessibilityDescription: nil)?
-                .withSymbolConfiguration(MenuMetrics.symbol), forSegment: i)
-            control.setImageScaling(.scaleNone, forSegment: i)
-            control.setLabel(choice.label, forSegment: i)
-            control.setToolTip(choice.hint, forSegment: i)
-        }
-        control.target = self
-        control.action = #selector(chosen)
-        control.setAccessibilityLabel("Appearance")
-        // 24 pt on macOS 26 (measured, tools/menu-render): 4 pt under the section header like the
-        // slider, the hint where the slider row's hints sit, 8 pt between them. Row 56 = 7 x 8.
-        let height = control.fittingSize.height
-        control.frame = NSRect(x: edge, y: 52 - height, width: w - 2 * edge, height: height)
-        hint.frame = NSRect(x: edge - 2, y: 6, width: w - 2 * edge + 4, height: 14)
-        hint.lineBreakMode = .byTruncatingTail
-        addSubview(control)
-        addSubview(hint)
-    }
-
-    required init?(coder: NSCoder) { fatalError("not from a nib") }
-
-    func update(_ appearance: Appearance) {
-        current = appearance
-        guard let i = Self.choices.firstIndex(where: { $0.appearance == appearance }) else { return }
-        if control.selectedSegment != i { control.selectedSegment = i }
-        hint.stringValue = Self.choices[i].hint
-    }
-
-    @objc private func chosen() {
-        guard Self.choices.indices.contains(control.selectedSegment) else { return }
-        let choice = Self.choices[control.selectedSegment]
-        hint.stringValue = choice.hint
-        guard choice.appearance != current else { return }
-        current = choice.appearance
-        onChange(choice.appearance)
-    }
-}
-
-extension TempUnit {
-    var menuTitle: String {
-        switch self {
-        case .fahrenheit: "°F Fahrenheit"
-        case .celsius: "°C Celsius"
-        }
-    }
-}
-
-// MARK: - Switch rows
-
-// A setting as a switch, the way macOS 26's own menu-bar menus show them: symbol and title on
-// the native columns, the switch on the trailing edge. A click anywhere on the row flips it.
-@MainActor
-final class SwitchRowView: NSView {
+final class ToggleTileView: TileView {
     var onToggle: (Bool) -> Void = { _ in }
-    private let toggle = NSSwitch()
-
-    var isOn: Bool {
-        get { toggle.state == .on }
-        set { toggle.state = newValue ? .on : .off }
+    var isOn = false {
+        didSet {
+            setAccessibilityValue(isOn)
+            needsDisplay = true
+            tint()
+        }
     }
 
-    init(title: String, symbol: String) {
-        super.init(frame: NSRect(x: 0, y: 0, width: MenuMetrics.width, height: 28))
-        let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
-            .withSymbolConfiguration(MenuMetrics.symbol) ?? NSImage())
-        icon.contentTintColor = .labelColor
-        icon.frame = NSRect(x: MenuMetrics.edge, y: 6, width: MenuMetrics.iconWidth, height: 16)
-        icon.imageAlignment = .alignCenter
-        let text = label(MenuMetrics.titleFont, .labelColor)
-        text.stringValue = title
-        toggle.controlSize = .small
-        toggle.target = self
-        toggle.action = #selector(flipped)
-        toggle.setAccessibilityLabel(title)
-        // On macOS 26 a switch's fittingSize is 54 x 24 at every control size and a small one
-        // draws 44 x 20 centred in it, so its frame is set to what it draws: it then ends on
-        // the trailing edge like the key equivalents.
-        toggle.frame = NSRect(x: MenuMetrics.width - MenuMetrics.edge - 44, y: 4, width: 44, height: 20)
-        text.frame = NSRect(x: MenuMetrics.titleX, y: 6, width: toggle.frame.minX - 8 - MenuMetrics.titleX, height: 16)
-        for view in [icon, text, toggle] as [NSView] { addSubview(view) }
+    private let icon = NSImageView()
+    private let title = label(MenuMetrics.labelFont, .labelColor)
+
+    init(symbol: String, title: String, label: String, tip: String? = nil) {
+        super.init(frame: NSRect(x: 0, y: 0, width: MenuMetrics.quarter, height: MenuMetrics.quarter))
+        let inset = MenuMetrics.inset + 2
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 16, weight: .medium))
+        icon.imageAlignment = .alignLeft
+        icon.frame = NSRect(x: inset, y: bounds.height - inset - 20, width: bounds.width - 2 * inset, height: 20)
+        self.title.stringValue = title
+        self.title.frame = NSRect(x: inset - 2, y: inset - 1, width: bounds.width - 2 * inset + 4, height: 15)
+        self.title.lineBreakMode = .byTruncatingTail
+        addSubview(icon)
+        addSubview(self.title)
+        toolTip = tip ?? label
+        setAccessibilityElement(true)
+        setAccessibilityRole(.checkBox)
+        setAccessibilityLabel(label)
+        setAccessibilityValue(false)
+        tint()
     }
 
     required init?(coder: NSCoder) { fatalError("not from a nib") }
 
-    @objc private func flipped() { onToggle(isOn) }
+    override var fillColour: NSColor {
+        guard isOn else { return super.fillColour }
+        let accent = NSColor.controlAccentColor
+        return pressed ? accent.blended(withFraction: 0.18, of: .black) ?? accent
+            : hovering ? accent.blended(withFraction: 0.08, of: .black) ?? accent : accent
+    }
 
-    // Taken, so the row gets the mouseUp that flips it.
-    override func mouseDown(with event: NSEvent) {}
+    private func tint() {
+        var ink = NSColor.labelColor
+        if isOn { effectiveAppearance.performAsCurrentDrawingAppearance { ink = MenuMetrics.ink(on: .controlAccentColor) } }
+        icon.contentTintColor = ink
+        title.textColor = ink
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        tint()
+    }
+
+    override func mouseDown(with event: NSEvent) { pressed = true }
 
     override func mouseUp(with event: NSEvent) {
+        guard pressed else { return }
+        pressed = false
         guard bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
         isOn.toggle()
         onToggle(isOn)
     }
+
+    override func accessibilityPerformPress() -> Bool {
+        isOn.toggle()
+        onToggle(isOn)
+        return true
+    }
+}
+
+// MARK: - Footer
+
+// The rare actions as symbol buttons on the trailing edge, where a menu's key equivalents sit.
+@MainActor
+final class FooterView: NSView {
+    let reload = IconButton(symbol: "arrow.clockwise", label: "Reload page", tip: "Reload page")
+    let folder = IconButton(symbol: "folder", label: "Open page folder", tip: "Open page folder")
+    let quit = IconButton(symbol: "xmark.square", label: "Quit KilnWall", tip: "Quit KilnWall  ⌘Q")
+
+    init() {
+        super.init(frame: NSRect(x: 0, y: 0, width: MenuMetrics.content, height: 24))
+        for (i, button) in [quit, folder, reload].enumerated() {
+            button.frame = NSRect(x: bounds.width - 24 - CGFloat(i) * 28, y: 0, width: 24, height: 24)
+            addSubview(button)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError("not from a nib") }
 }
 
 // MARK: - Design pictures
@@ -800,7 +1083,7 @@ final class SwitchRowView: NSView {
 // A small picture of each design for the grid, ~/Library/Application Support/KilnWall/
 // design-pictures/<id>.jpg, cut from the desktop snapshots the wallpaper already takes (Desktop.swift): the
 // design being shown has its picture refreshed from the newest snapshot of it, so every design
-// that has been on screen has one. Pictures are 336 px wide, twice the widest tile.
+// that has been on screen has one. Pictures are 336 px wide, over twice the widest tile.
 enum DesignPictures {
     nonisolated static let folder = KilnSupport.folder.appendingPathComponent("design-pictures", isDirectory: true)
     nonisolated private static let pixels = 336

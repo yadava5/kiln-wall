@@ -3,14 +3,14 @@
 //
 //   xcrun swiftc -O -target arm64-apple-macos26.0 Sources/Menu.swift Sources/Settings.swift tools/menu-render/main.swift -o /tmp/menu-render
 //   /tmp/menu-render <out-dir> [--hover <design-id>] [--light running|covered|paused]
-//                    [--appearance auto|light|dark] [--temp-unit F|C]
+//                    [--appearance auto|light|dark] [--temp-unit F|C] [--design <design-id>]
 //
 // The custom rows are Menu.swift's own views, built by KilnMenu exactly as the app builds them.
 // The native rows are AppKit's own menu item views, taken from the menu's implementation
 // (private API, here only; the app never calls it), so their columns are the real ones. What
-// this cannot show: the menu's glass and the header's NSGlassEffectView, which the window server
-// composites; a flat stand-in is painted behind them instead (light #F6F6F6, dark #2C2C2E, the
-// card a shade off), so judge layout, type and colour here, and the glass on the real menu.
+// this cannot show: the menu's glass, which the window server composites; a flat stand-in is
+// painted behind the tiles instead (light #F6F6F6, dark #2C2C2E), so judge layout, type and
+// colour here, and the glass on the real menu.
 import AppKit
 import ObjectiveC
 
@@ -48,11 +48,13 @@ MainActor.assumeIsolated {
     }
 
     let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/kiln-wall/designs")
+    let all = designs(root)
+    let current = option("--design") ?? "ledger"
     let state = MenuState(
         light: light,
         stateText: light == .running ? "Running" : light == .covered ? "Desktop covered" : "Paused by you",
         feedText: light == .covered ? "Feed: kiln-feed.py (pid 95261), held at 1000 ms" : "Feed: kiln-feed.py (pid 95261)",
-        designName: "The Ledger", periodMs: 300, designs: designs(root), currentDesign: "ledger",
+        designName: all.first { $0.id == current }?.name ?? current, periodMs: 300, designs: all, currentDesign: current,
         designsFolder: "~/.config/kiln-wall/designs", hidden: false, pausedByYou: light == .paused,
         matchDesktop: true, launchAtLogin: false,
         appearance: option("--appearance").flatMap(Appearance.init(rawValue:)) ?? .auto,
@@ -91,21 +93,15 @@ MainActor.assumeIsolated {
         }
     }
     for (view, h) in rows { print("row \(type(of: view)) \(h) pt") }
-    for case let control as NSSegmentedControl in rows.flatMap({ [$0.0] + $0.0.allSubviews }) {
-        print("segmented control \(control.frame) (fitting \(control.fittingSize), control size \(control.controlSize.rawValue))")
-    }
     let height = rows.reduce(10) { $0 + $1.1 }
     print("stacked height \(height) (menu.size says \(menu.size.height))")
 
     final class Backdrop: NSView {
-        var card = NSRect.zero
         override func draw(_ dirtyRect: NSRect) {
             let dark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
             (dark ? NSColor(srgbRed: 0x2C / 255, green: 0x2C / 255, blue: 0x2E / 255, alpha: 1)
                   : NSColor(srgbRed: 0xF6 / 255, green: 0xF6 / 255, blue: 0xF6 / 255, alpha: 1)).setFill()
             bounds.fill()
-            (dark ? NSColor(white: 1, alpha: 0.07) : NSColor(white: 1, alpha: 0.75)).setFill()
-            NSBezierPath(roundedRect: card, xRadius: 10, yRadius: 10).fill()
         }
     }
     let backdrop = Backdrop(frame: NSRect(x: 0, y: 0, width: width, height: height))
@@ -121,17 +117,6 @@ MainActor.assumeIsolated {
         backdrop.addSubview(holder)
         holder.addSubview(view)
         view.frame = holder.bounds
-        // The glass draws as an opaque white sheet when cached offscreen: its content goes on
-        // a plain view in its place, over the painted stand-in.
-        if #available(macOS 26.0, *), view is StatusHeaderView,
-           let glass = view.subviews.first as? NSGlassEffectView, let content = glass.contentView {
-            let plain = NSView(frame: glass.frame)
-            glass.contentView = nil
-            content.frame = plain.bounds
-            plain.addSubview(content)
-            view.replaceSubview(glass, with: plain)
-            backdrop.card = plain.convert(plain.bounds, to: backdrop)
-        }
     }
     backdrop.layoutSubtreeIfNeeded()
     for case let holder in backdrop.subviews { if let view = holder.subviews.first, view.frame != holder.bounds { print("moved: \(type(of: view)) \(view.frame) in \(holder.frame)") } }
@@ -154,7 +139,7 @@ MainActor.assumeIsolated {
         for view in backdrop.allSubviews { view.needsDisplay = true }
         let rep = backdrop.bitmapImageRepForCachingDisplay(in: backdrop.bounds)!
         backdrop.cacheDisplay(in: backdrop.bounds, to: rep)
-        let variant = ["--light", "--appearance", "--temp-unit"].compactMap { option($0).map { "-" + $0 } }.joined()
+        let variant = ["--light", "--appearance", "--temp-unit", "--design"].compactMap { option($0).map { "-" + $0 } }.joined()
             + (option("--hover").map { "-hover-" + $0 } ?? "")
         let file = out.appendingPathComponent("menu-\(name)\(variant)@2x.png")
         try! rep.representation(using: .png, properties: [:])!.write(to: file)
