@@ -8,7 +8,18 @@ import os
 
 @MainActor
 final class Feed {
-    nonisolated static let defaultScript = "/Users/ayush/.config/kitty/kiln-feed.py"
+    // $KILN_FEED_SCRIPT if set (a "~/" prefix is expanded); else the first of
+    // ~/.config/kiln-wall/feed/kiln-feed.py (where the README installs it) and
+    // ~/.config/kitty/kiln-feed.py (where it lives beside the kitty setup) that exists;
+    // else the first, so the "missing" log names the documented place.
+    nonisolated static let defaultScript: String = {
+        if let path = ProcessInfo.processInfo.environment["KILN_FEED_SCRIPT"], !path.isEmpty {
+            return (path as NSString).expandingTildeInPath
+        }
+        let home = NSHomeDirectory() as NSString
+        let places = [".config/kiln-wall/feed/kiln-feed.py", ".config/kitty/kiln-feed.py"].map(home.appendingPathComponent)
+        return places.first(where: FileManager.default.fileExists(atPath:)) ?? places[0]
+    }()
     private static let python = "/usr/bin/python3"
     private static let retryInterval: TimeInterval = 30
     private static let maxBackoff: TimeInterval = 60
