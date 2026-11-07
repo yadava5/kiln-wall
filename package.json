@@ -12,6 +12,6 @@
     "scrub": "bash scripts/scrub-check.sh"
   },
   "devDependencies": {
-    "playwright-core": "1.62.0"
+    "playwright-core": "1.64.1"
   }
 }
