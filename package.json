@@ -7,6 +7,7 @@
     "fixture": "node demo/make-fixture.mjs",
     "errcount": "node demo/errcount-all.mjs",
     "stills": "node demo/stills.mjs",
+    "media": "node demo/media.mjs all",
     "geomcheck": "node designs/_shared/dev/geomcheck.mjs",
     "audit": "node designs/_shared/dev-audit.mjs",
     "scrub": "bash scripts/scrub-check.sh"
