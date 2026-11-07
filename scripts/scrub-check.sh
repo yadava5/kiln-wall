@@ -37,6 +37,12 @@ b35e16d0d135be3c bbebec50e47b8dc6 bc321492ad33afc6 bf69453240b00446 c07a7c07fd54
 c7a65f6369e7a127 cd5430295cd2c3a4 d27200032bd8d877 d371e4ecc9678aac d703a32a7ae5d356 e32efe6cec98e1a2
 e3edddb0ed97a47b ede713f05b636055 eefd0d7defd4cb5a f831c3a29d05f41f fc76c15ec39f410c fe4d66bc1928178b
 """.split())
+# The first 12 characters of the long denylisted names, hashed the same way, so a truncated
+# quote ("some-long-session-na...") is caught as well as the whole name.
+PREFIX12 = set("""
+0cba0f6c9936dc9a 1055f870a722f452 2464388875ea5fa3 437202ed09b049b5 55e828db2ffac541 60d2b73f64bf7c89
+9032f9a18699cb4f d2679d2496751264 d3e70552c2f46efb
+""".split())
 h16 = lambda s: hashlib.sha256(s.encode()).hexdigest()[:16]
 extra = ".release-notes/denylist.txt"
 if os.path.exists(extra):
@@ -92,6 +98,9 @@ for f in files:
                 hit(f, n, what, m.group(0))
         for m in TOKEN.finditer(line):
             tok = m.group(0).strip(".:/-@").lower()
+            if len(tok) >= 12 and h16(tok[:12]) in PREFIX12:
+                hit(f, n, "denylisted name (truncated or whole)", tok)
+                continue
             for piece in {tok, *re.split(r"[._:/@]+", tok)}:
                 piece = piece.strip("-")
                 if piece and h16(piece) in DENY:
