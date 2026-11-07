@@ -1311,7 +1311,7 @@
         }
         txt(o.tm, hhmm(x.e.t));
         // a run of events from one session names it once, at the top, as a log's ditto does
-        // (seven rows of "claude-kitty-setup-..." said one thing seven times)
+        // (seven rows repeating one truncated session name said one thing seven times)
         const above = list[i - 1], same = above && (x.e.sid || x.e.name) && (above.e.sid || above.e.name) === (x.e.sid || x.e.name);
         txt(o.nm, same ? "" : x.e.name || "");
         txt(o.age, two(Math.max(0, t - x.e.t)));
