@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Flight Deck</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+@font-face{font-family:"B612";src:url(fonts/B612-Regular.woff2) format("woff2");font-weight:400}
+@font-face{font-family:"B612";src:url(fonts/B612-Bold.woff2) format("woff2");font-weight:700}
+
+/* Glass-cockpit colour logic (Airbus ECAM convention):
+   white = a value, green = normal / running, cyan = the target you steer by,
+   amber = caution, magenta = forecast / trend, red = failure.
+   Text colours measured against the rendered pixels behind them (notes.md).
+   One look (README, Preferences): Kiln.appearance is not read anywhere in this design. */
+:root{
+  --val:#F2F4F0; --lab:#CDD5DD; --tick:#6E7C8C; --rule:rgba(188,198,209,.16); --rule2:rgba(188,198,209,.18); --rule3:rgba(188,198,209,.09);
+  --grn:#8CE6AA; --amb:#FFB547; --ambv:#FFCB78; --cyn:#94E0F6; --mag:#F6BEF9; --red:#FF6B5E; --off:#C4CDD6;
+  --idle:#8D99A6; --hl:#BCC6D1; --wired:#E9ECEF; --flow:#7AD6F2; --hlite:#0D2A33; --hatchM:#EE9BF5; --grnF:#8CE6AA;
+  /* --glass is a display's ground; --halo the same colour, ringing figures that sit on a line;
+     --box a readout window, one step deeper than the ground; --tape the tape's well */
+  --glass:#04070A; --halo:#04070A; --box:#020305; --tape:#06090D; --edge:#000; --over:.78;
+  /* the panel's materials: bezel metal (top, lip, foot), its lit lip, the glass sheen, the
+     lower panel (top, under the lip, foot) and the lit edge of the panel */
+  --bz0:#2A2F37; --bz1:#1A1E24; --bz2:#0E1014; --lip:#8D97A3; --lipA:.55; --sheen:#B9C6D6; --sheenA:.07;
+  --pn0:#1A1D22; --pn1:#121418; --pn2:#08090B; --edgeLit:#9AA4B0; --edgeLitA:.28;
+}
+*{box-sizing:border-box;margin:0}
+html,body{height:100%;overflow:hidden;background:#06080B;color:var(--val)}
+body{font-family:"B612",sans-serif;font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
+svg{display:block;max-width:100%;overflow:visible}
+text{font-family:"B612",sans-serif}
+
+/* the whole deck is laid out on the 1512 x 982 pt screen it was measured on, then scaled to cover */
+#stage{position:absolute;left:0;top:0;width:1512px;height:982px;transform-origin:0 0}
+.layer{position:absolute;inset:0;width:1512px;height:982px}
+.abs{position:absolute}
+
+/* the windscreen: sky.js fills these with canvases that move by transform only */
+#sky,#glass{height:622px;overflow:hidden;pointer-events:none}
+#sky canvas,#glass canvas,#runs{position:absolute;left:0;top:0}
+#sky .drift,#glass .drift{will-change:transform;transform-origin:0 0}
+#panel,#ink{pointer-events:none}
+
+/* Layers (KilnWall measured 294 MB of graphics when every part over the sky got its own):
+   #deck is ONE full-screen layer holding everything static or text: panel, ink and
+   the HTML columns. #mv holds the small moving parts, each its own layer, moved by a
+   transform set once per update; the compositor runs the transition, so nothing paints
+   between lines. #top holds the few small pieces the original draws over a moving part. */
+#deck{will-change:transform;pointer-events:none}
+#mv,#top{pointer-events:none}
+#mv svg,#mv div,#top svg,#top div{position:absolute;left:0;top:0;overflow:visible}
+#mv .clip,#deck .clip{overflow:hidden}
+/* each piece in #top is its own small layer: left to paint into #top, they made it a
+   full-screen backing store (23 MB at 2x) because #top overlaps the moving layers */
+#top>div{will-change:transform}
+.mv{will-change:transform;transition:transform var(--kiln-tween) cubic-bezier(.33,1,.68,1)}
+.roll{will-change:transform;transition:transform var(--kiln-tween) linear}
+.boot .mv,.kiln-paused .mv,.snap .mv,.boot .roll,.kiln-paused .roll,.snap .roll{transition:none}
+/* the first rows land in place: the fold line slid down from the top of the column on load */
+.boot .eng,.boot .fold,.boot .log,.boot .log .e{transition:none}
+
+/* The deck in layers, top to bottom (2026-11-05, "transparent elements … in a specific order"):
+   1. the windscreen: the real sky, nothing over it but the panes below;
+   2. the glareshield, one pane of canopy glass across the top (72-1440, 40-113) holding the
+      clock, the annunciator lamps and the weather, the way a glareshield holds the master
+      lights between the two pilots;
+   3. the two side panes, level with the PFD (127-613): sessions and the log on the left, the
+      systems page on the right. Canopy glass again, but these end on the panel's edge;
+   4. the PFD, a smoked display seated between them (--over: the sky still shows through, dimly);
+   5. the instrument panel from 622 down, opaque, with three displays set into it.
+   One grid: columns 72-410, 424-1088, 1102-1440 (margins 72 both sides, gaps 14), and the
+   lower displays' bezels sit on the same verticals.
+   Each pane is a physical thing with crisp edges (a lit top edge, a faint rim all round, a dark
+   lower edge, a hairline outside and the displays' own sheen), and the sky shows through it,
+   softened. Its smoke is electrochromic: sky.js reads the sky as painted behind every pane and
+   sets the least smoke (--a) that keeps the faintest ink legible, the same for all. A night sky
+   that carries white ink gets none: the glass goes clear and its edges fade with it (--e). The
+   glareshield keeps a floor of smoke: it is the instrument the lamps are set in.
+   Nothing here shades the sky outside a pane, and nothing fades (README, "No veils on the sky").
+   Panes never move and nothing on them animates. */
+#cg{pointer-events:none}
+#cg .pane{position:absolute;border-radius:10px;--a:0;--e:0;
+  background:linear-gradient(160deg,rgba(185,198,214,calc(.1*var(--e))) 0,rgba(185,198,214,0) 36%),rgba(4,8,13,var(--a));
+  box-shadow:inset 0 1px 0 rgba(222,232,242,calc(.36*var(--e))),inset 0 0 0 1px rgba(222,232,242,calc(.08*var(--e))),
+    inset 0 -1px 0 rgba(0,0,0,calc(.32*var(--e))),0 0 0 .5px rgba(222,232,242,calc(.2*var(--e)));
+  -webkit-backdrop-filter:blur(5px) saturate(1.4);backdrop-filter:blur(5px) saturate(1.4)}
+#cg .pane.clear{-webkit-backdrop-filter:none;backdrop-filter:none}
+.sk{color:var(--val)}   /* color inherits as a value: each block resolves its own --val */
+/* The windscreen's inks are a step lighter than the displays' (the panes are never as deep as
+   display glass): every ink sits near the label's luminance (Y 0.75), so red holds the text
+   floor (#FF6B5E would be about Lc 45) and the small coloured figures hold Lc 75. Magenta is
+   the palest (#FAD4FB, Y 0.74): at #F8CCFA the write rate measured Lc 73.2 on a foggy noon. */
+.sk{--lab:#DCE2E8;--off:#DCE2E8;--amb:#FFD58F;--cyn:#C2EFFB;--grn:#A8F0C0;--red:#FFB3AA;--mag:#FAD4FB}
+/* the display glass: near-opaque in the lower row; the PFD lets the sky through (--over) */
+.du-glass{fill:var(--glass);opacity:.97} .du-glass.over{opacity:var(--over)}
+
+.h{font-size:13px;color:var(--lab);display:flex;justify-content:space-between;align-items:baseline;
+  padding-bottom:5px;border-bottom:1px solid var(--rule);margin-bottom:6px}
+/* the heading's figure fills the rest of the rule, right-aligned: its box never depends on its text (rule 13) */
+.h b{font-weight:400;color:var(--val);flex:1;text-align:right;white-space:nowrap}
+
+/* The glareshield. The clock and the temperature share one top line (54), so their 48 pt
+   figures stand on one baseline (95.2) and sit 14 pt inside the pane, top and bottom. The
+   date's second line stands on the clock's baseline too: B612's ascent is .965 em and its
+   descent .25, so a 48/48 line has its baseline 6.84 pt above the box's foot and a 13.5/18.9
+   line 4.62; the date block's foot is raised by the difference. The lamps sit between them,
+   centred on the PFD's axis (deck.js lamps). */
+.clock{left:84px;top:54px;display:flex;align-items:flex-end;gap:12px}
+.clock .t{font-size:48px;font-weight:700;line-height:1;letter-spacing:-.01em}
+.clock .t small{font-size:18px;font-weight:400;color:var(--lab);margin-left:4px}
+.clock .d{font-size:13.5px;color:var(--lab);line-height:1.4;padding-bottom:2.22px}
+.clock .d span:first-child{color:var(--val)}
+/* the weather mirrors the clock: its two lines stand on the temperature's baseline, as the
+   date's do on the time's, and the block hangs from the pane's right inset */
+.wx{right:84px;top:54px;display:flex;align-items:flex-end;gap:16px}
+.wx .temp{font-size:48px;font-weight:700;line-height:1}
+.wx #wt{display:inline-block;min-width:2ch;text-align:right}
+.wx .temp small{font-size:18px;color:var(--lab);font-weight:400}
+.wx .cond{font-size:13.5px;color:var(--lab);line-height:1.4;text-align:right;white-space:nowrap;padding-bottom:2.22px}
+.wx .cond span:first-child{color:var(--val)}
+
+/* left pane: sessions as engine strips, then the flight log under them. Both are 12 pt inside
+   the pane (84-398). The log's top follows the session list (deck.js engines sets it) and
+   moves only when a session comes or goes, never per line. */
+.left{left:84px;top:136px;width:314px}
+#engines{position:relative;height:212px;contain:layout}
+.eng{position:absolute;left:0;top:0;width:314px;display:grid;grid-template-columns:70px minmax(0,1fr);column-gap:10px;
+  padding:5px 0 6px;border-bottom:1px solid var(--rule);transition:transform .3s ease}
+.eng.last{border-bottom:0}
+.eng .name{font-size:14px;color:var(--val);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.state{font-size:11px;letter-spacing:.1em;padding:0 5px;border-radius:3px;border:1px solid currentColor;flex:none}
+.st-working{color:var(--grn)} .st-background{color:var(--cyn)} .st-idle{color:var(--lab)} .st-waiting{color:var(--amb)} .st-failed{color:var(--red)}
+.figs{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr) minmax(0,.8fr);gap:2px;margin-top:2px}
+.figs div{font-size:15px;line-height:1.05}
+.figs div i{display:block;font-style:normal;font-size:11px;color:var(--lab)}
+.foot{font-size:11px;display:flex;justify-content:space-between;gap:8px;color:var(--lab);white-space:nowrap}
+/* quieter than the state badge by its hairline border, not by its text: --tick text measured Lc 31 */
+.foot .bgk{font-size:11px;letter-spacing:.1em;padding:0 4px;border-radius:3px;border:1px solid var(--rule);color:var(--off);flex:none}
+.foot .meta{overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1;text-align:right}
+/* a running agent hangs off its engine, like a pod on a pylon */
+.pod{grid-column:2;display:flex;justify-content:space-between;gap:8px;font-size:12px;margin-top:3px;padding-top:3px;border-top:1px dashed var(--rule2);height:18px}
+.pod .ty{color:var(--val);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1} .pod .ty.gp{color:var(--amb)}
+.pod .ag{color:var(--val);white-space:nowrap} .pod .ag i{font-style:normal;color:var(--lab)}
+.fold{position:absolute;left:0;width:314px;font-size:12px;color:var(--lab);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:transform .3s ease}
+
+/* the flight log, under the sessions in the left pane */
+.log{left:84px;top:380px;width:314px;transition:top .3s ease}
+.log .rows{position:relative;contain:layout}
+.log .e{position:absolute;left:0;top:0;width:314px;display:grid;grid-template-columns:42px minmax(0,1fr);column-gap:8px;
+  padding:3px 0 4px;border-bottom:1px solid var(--rule3);transition:transform .3s ease}
+.log .e.last{border-bottom:0}
+.log .tm{font-size:12.5px;color:var(--val)}
+.log .who{font-size:12px;color:var(--lab);display:flex;justify-content:space-between;gap:6px;min-width:0;white-space:nowrap}
+.log .who b{font-weight:400;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1}
+.log .who i{font-style:normal;flex:none;width:64px;text-align:right}   /* "23 h 59 m" is 61.8 */
+.log .what{grid-column:2;font-size:12.5px;line-height:1.3;color:var(--val);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.log .what.ask{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.log .what.gp{color:var(--amb)} .log .what.ask{color:var(--amb)} .log .what.ok{color:var(--grn)} .log .what.sys{color:var(--cyn)} .log .what.bad{color:var(--red)}
+
+/* right pane: systems page, 12 pt inside its pane (1114-1428) */
+.right{left:1114px;top:136px;width:314px;display:flex;flex-direction:column;gap:10px}
+.big{font-size:30px;font-weight:700;line-height:1}
+.big small{font-size:14px;font-weight:400;color:var(--lab)}
+/* a label and a right-aligned value in a fixed slot (--vw): a figure that changes never
+   shoves anything (rule 13). The label column takes the rest and truncates. */
+.kv{display:grid;grid-template-columns:minmax(0,1fr) var(--vw,64px);column-gap:8px;font-size:12.5px;color:var(--lab);margin-top:3px;white-space:nowrap}
+.kv span{color:var(--val)}
+.kv .lab{color:var(--lab)}
+.kv>span:first-child{overflow:hidden;text-overflow:ellipsis;min-width:0}
+.kv>span:last-child{text-align:right}
+.kv3{grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto}   /* "compressed 4.9 GB" takes its own width */
+/* disk: used, then read and write in network's colours (amber is reserved for caution) */
+.kvd{grid-template-columns:minmax(0,1fr) auto 62px auto 62px;column-gap:6px}
+.kv .rd{color:var(--cyn);margin-right:10px} .kv .wr{color:var(--mag)}
+/* network readouts: the arrow, then the rate right-aligned in a slot for "999 kB/s" (90 px) */
+.nr{display:grid;grid-template-columns:auto 92px;column-gap:6px;justify-content:start;font-size:20px;white-space:nowrap}
+.nr>span:last-child{text-align:right}
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.warn{color:var(--amb)!important} .ok{color:var(--grn)!important}
+.press rect{fill:none;stroke:var(--hl);stroke-opacity:.25} .press text{fill:var(--off)}
+.press .on rect{stroke-opacity:1}
+.press .on.normal rect{fill:rgba(110,219,148,.16);stroke:var(--grn)} .press .on.normal text{fill:var(--grn)}
+.press .on.warn rect{fill:rgba(255,181,71,.16);stroke:var(--amb)} .press .on.warn text{fill:var(--amb)}
+.press .on.critical rect{fill:rgba(255,107,94,.18);stroke:var(--red)} .press .on.critical text{fill:var(--red)}
+.alt{display:none}
+.g-memory .memblk{display:none} .g-memory .alt{display:block}
+
+/* annunciators: a lamp lights only when it has something to say (dark cockpit). An unlit lamp
+   is a lens window in the glareshield's glass, a step deeper than it; a lit one is an opaque
+   lens that glows. */
+.lamp .lb{fill:#020407;fill-opacity:.45;stroke:#C8D2DE;stroke-opacity:.26} .lamp .lg{fill:#FFD9A0;opacity:0}
+.lamp.amb .lb,.lamp.red .lb{fill-opacity:1;stroke-opacity:1}
+/* an unlit lamp's reading takes the windscreen's label ink (#DCE2E8, .sk): at #D0D8E0 "250 ms"
+   measured Lc 74.6 on the strip on a foggy noon */
+.lamp .ll{fill:var(--off)} .lamp .lv{fill:var(--lab)}
+.lamp.amb .lb{fill:#3A2A10;stroke:rgba(255,181,71,.8)} .lamp.amb .lg{opacity:.08} .lamp.amb .ll{fill:var(--amb)} .lamp.amb .lv{fill:var(--val)}
+.lamp.red .lb{fill:#3D1512;stroke:var(--red)} .lamp.red .lg{fill:#FFB0A8;opacity:.08} .lamp.red .ll{fill:var(--red)} .lamp.red .lv{fill:var(--val)}
+/* the UPDATE lamp's live dot: an HTML layer so its beat runs on the compositor. It rests at
+   .5 and beats to 1 on Kiln.onBeat (deck.js); when lines stop it goes grey and dim. */
+#mv .pulse{width:6.4px;height:6.4px;margin:-3.2px 0 0 -3.2px;border-radius:50%;background:var(--grn);opacity:.5;
+  will-change:opacity;transition:opacity .6s ease,background-color .6s ease}
+.kiln-stale #mv .pulse{background:var(--tick);opacity:.6}
+@media (prefers-reduced-motion: reduce){ #mv .pulse{opacity:.85} }
+
+/* presets */
+.hide-tape [data-part~=tape],.hide-cpu [data-part~=cpu],.hide-flow [data-part~=flow],.hide-sys [data-part~=sys],
+.hide-lower [data-part~=lower]{display:none}
+/* not rendered at all unless dimmed: an invisible full-screen box above layers is still a layer */
+#dim{position:absolute;inset:0;background:#000;display:none;pointer-events:none}
+.dimmed #dim{display:block;opacity:var(--dim,.3)}
+
+@media (prefers-reduced-motion: reduce){ *{animation:none!important;transition:none!important} }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div class="layer" id="sky" aria-hidden="true"></div>
+  <div class="layer" id="glass" aria-hidden="true"></div>
+  <!-- canopy glass: the glareshield and the two side panes (stage points; sky.js reads these boxes) -->
+  <div class="layer" id="cg" aria-hidden="true">
+    <div class="pane" data-p="shield" style="left:72px;top:40px;width:1368px;height:73px"></div>
+    <div class="pane" data-p="left" style="left:72px;top:127px;width:338px;height:486px"></div>
+    <div class="pane" data-p="right" style="left:1102px;top:127px;width:338px;height:486px"></div>
+  </div>
+<div class="layer" id="deck">
+  <svg class="layer" id="panel" viewBox="0 0 1512 982" aria-hidden="true"></svg>
+  <svg class="layer" id="ink" viewBox="0 0 1512 982" aria-label="Flight deck instruments"></svg>
+
+  <div class="abs clock sk"><div class="t"><span id="hm">--:--</span><small id="ss"></small></div><div class="d"><span id="dt"></span><br><span id="lz"></span></div></div>
+  <div class="abs wx sk">
+    <div class="cond"><span id="wc"></span><br><span id="ww"></span></div>
+    <div class="temp"><span id="wt">–</span>°<small id="wu">F</small></div>
+  </div>
+
+  <section class="abs left sk"><div class="h">Sessions, last 60 min <b id="sessCount"></b></div><div id="engines"></div></section>
+  <section class="abs log sk" id="log"><div class="h">Flight log <b id="logCount"></b></div><div class="rows" id="logRows"></div></section>
+  <section class="abs right sk" id="sys" data-part="sys"></section>
+</div>
+  <div class="layer" id="mv" aria-hidden="true"></div>
+  <div class="layer" id="top" aria-hidden="true"></div>
+  <div id="dim"></div>
+</div>
+
+<script>document.documentElement.classList.add("boot")   // first values land without a transition</script>
+<script src="../_shared/kiln-runtime.js"></script>
+<script src="config.js"></script>
+<script src="sky.js"></script>
+<script src="deck.js"></script>
+</body>
+</html>

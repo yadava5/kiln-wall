@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Glass Control Room</title>
+<style>
+@font-face { font-family: "Atkinson Next"; src: url("fonts/atkinson-hyperlegible-next-latin.woff2") format("woff2"); font-weight: 200 800; }
+@font-face { font-family: "Red Hat Display"; src: url("fonts/RedHatDisplay.ttf") format("truetype"); font-weight: 300 900; }
+
+/* Night glass is the default and the dark scheme. Ink values are the v2 concept's, measured
+   against the lightest rendered pane pixels; the day set is measured the same way (notes.md). */
+:root {
+  --ink: #f2f4f8;
+  --ink-2: #d4dae5;
+  --ink-3: #c6cdd9;
+  --claude: #ffb45c;      /* sodium: everything that is Claude usage, and the GitHub year */
+  --claude-deep: #e8873a;
+  --claude-hi: #ffd8a3;
+  --machine: #7fd4ff;     /* ice: everything that is this Mac */
+  --machine-2: #9fdcff;
+  --machine-3: #4f9cc9;
+  --ok: #6ee7b7;
+  --ok-deep: #3fbf8e;
+  --agent: #cfc2ff;
+  --alert: #ffb0a3;
+  --idle: #c6cdd9;
+  --mute: #8b93a3;
+  --on-fill: #10131c;     /* text set inside a lit bar */
+  --halo: rgba(32, 31, 40, 0.85);   /* the pane's tone behind in-plot labels */
+  --glass: rgba(16, 21, 34, 0.6);
+  --glass-edge: rgba(255, 255, 255, 0.14);
+  --glass-lit: rgba(255, 255, 255, 0.36);
+  --glass-foot: rgba(255, 255, 255, 0.06);
+  --glass-thick: rgba(255, 255, 255, 0.10);
+  --sheen: rgba(255, 255, 255, 0.075);
+  --hair: rgba(255, 255, 255, 0.10);
+  --track: rgba(255, 255, 255, 0.10);
+  --grid: rgba(255, 255, 255, 0.09);
+  --grid-0: rgba(255, 255, 255, 0.2);
+  --cal-0: rgba(255, 255, 255, 0.075);
+  --cal-1: rgba(255, 180, 92, 0.30);
+  --cal-2: rgba(255, 180, 92, 0.52);
+  --cal-3: rgba(255, 180, 92, 0.80);
+  --cal-4: #ffd8a3;
+  --mark: #ffffff;
+  --flag-bg: rgba(255, 180, 92, 0.12);
+  --flag-edge: rgba(255, 180, 92, 0.32);
+  --flag-ink: #ffcf96;
+  /* the window: the two figures straight on the sky (sky.js ink() sets data-sky; these hold
+     until it has run) */
+  --wink: #ffffff;
+  --wshadow: 0 0 2px rgba(0, 0, 0, 0.55);
+  --gap: 10px;
+  /* motion: one ease for every glide; the runtime keeps --kiln-tween at 60 % of the period */
+  --ease: cubic-bezier(0.33, 1, 0.68, 1);
+  --glide: var(--kiln-tween, 180ms) var(--ease);
+  --num: "Red Hat Display", ui-sans-serif, sans-serif;
+  --text: "Atkinson Next", ui-sans-serif, sans-serif;
+  color-scheme: dark;
+}
+/* Day glass: pale frost, dark ink. Applies under the light scheme unless night is pinned,
+   and whenever day is pinned; the sun pins it (panes.js) unless config.js says "system". */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="night"]) {
+    --ink: #0a111c; --ink-2: #1d2838; --ink-3: #2b3646;
+    --claude: #8a4200; --claude-deep: #b85f0e; --claude-hi: #6b3300;
+    --machine: #005478; --machine-2: #4a9ccc; --machine-3: #0b4c72;
+    --ok: #005c3c; --ok-deep: #15936a; --agent: #4a2fb0; --alert: #a3221a; --idle: #3d495c; --mute: #5d6878;
+    --on-fill: #ffffff; --halo: rgba(226, 230, 235, 0.9);
+    --glass: rgba(242, 245, 249, 0.84); --glass-edge: rgba(255, 255, 255, 0.7); --glass-lit: rgba(255, 255, 255, 1);
+    --glass-foot: rgba(13, 21, 34, 0.08); --glass-thick: rgba(255, 255, 255, 0.5);
+    --sheen: rgba(255, 255, 255, 0.25); --hair: rgba(13, 21, 34, 0.12); --track: rgba(13, 21, 34, 0.10);
+    --grid: rgba(13, 21, 34, 0.10); --grid-0: rgba(13, 21, 34, 0.28);
+    --cal-0: rgba(13, 21, 34, 0.07); --cal-1: rgba(201, 106, 18, 0.30); --cal-2: rgba(201, 106, 18, 0.52);
+    --cal-3: rgba(201, 106, 18, 0.80); --cal-4: #7a3a00; --mark: #0d1522;
+    --flag-bg: rgba(201, 106, 18, 0.12); --flag-edge: rgba(160, 79, 0, 0.4); --flag-ink: #7a3a00;
+    color-scheme: light;
+  }
+}
+:root[data-theme="day"] {
+  --ink: #0a111c; --ink-2: #1d2838; --ink-3: #2b3646;
+  --claude: #8a4200; --claude-deep: #b85f0e; --claude-hi: #6b3300;
+  --machine: #005478; --machine-2: #4a9ccc; --machine-3: #0b4c72;
+  --ok: #005c3c; --ok-deep: #15936a; --agent: #4a2fb0; --alert: #a3221a; --idle: #3d495c; --mute: #5d6878;
+  --on-fill: #ffffff; --halo: rgba(226, 230, 235, 0.9);
+  --glass: rgba(242, 245, 249, 0.84); --glass-edge: rgba(255, 255, 255, 0.7); --glass-lit: rgba(255, 255, 255, 1);
+  --glass-foot: rgba(13, 21, 34, 0.08); --glass-thick: rgba(255, 255, 255, 0.5);
+  --sheen: rgba(255, 255, 255, 0.25); --hair: rgba(13, 21, 34, 0.12); --track: rgba(13, 21, 34, 0.10);
+  --grid: rgba(13, 21, 34, 0.10); --grid-0: rgba(13, 21, 34, 0.28);
+  --cal-0: rgba(13, 21, 34, 0.07); --cal-1: rgba(201, 106, 18, 0.30); --cal-2: rgba(201, 106, 18, 0.52);
+  --cal-3: rgba(201, 106, 18, 0.80); --cal-4: #7a3a00; --mark: #0d1522;
+  --flag-bg: rgba(201, 106, 18, 0.12); --flag-edge: rgba(160, 79, 0, 0.4); --flag-ink: #7a3a00;
+  color-scheme: light;
+}
+/* The appearance pins the glass; the sky behind it is always the real one (README, Preferences:
+   "Weather and sky are never fabricated"). sky.js sets data-light from the real sun. Where the
+   pinned glass disagrees with the light outside, the panes are cut thicker so their ink holds
+   the contrast it has over its own sky (APCA per run in notes.md, Real sky): night glass
+   under a day sky is smoked glass against the daylight, day glass under a night sky is milk
+   glass against the dark (the day glass's frost glow is the glass's own, sky.js paintSky). */
+:root[data-theme="night"][data-light="day"] { --glass: rgba(16, 21, 34, 0.92); --halo: rgba(24, 28, 40, 0.92); }
+:root[data-theme="day"][data-light="night"] { --glass: rgba(242, 245, 249, 0.96); }
+
+* { box-sizing: border-box; margin: 0; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0b1120; }
+body { font-family: var(--text); color: var(--ink); font-size: 13px; line-height: 1.3;
+  font-variant-numeric: tabular-nums; -webkit-font-smoothing: antialiased; position: relative; }
+svg { display: block; overflow: visible; }
+canvas { display: block; }
+.num { font-family: var(--num); letter-spacing: -0.01em; }
+/* Fixed slots (README rule 13): a changing figure sits right-aligned in a box sized for the
+   widest value it shows, so its unit and every neighbour stay put. Tabular digits are 0.6em in
+   Red Hat Display and 0.632em in Atkinson, so the widths below are counted in em. */
+.slot { display: inline-block; text-align: right; font-style: normal; }
+.u1 { display: inline-block; min-width: 0.8em; }       /* a one-letter magnitude: k, M, B */
+.d2 { display: inline-block; min-width: 1.27em; text-align: right; font-style: normal; }  /* a two-digit count in a duration */
+
+/* ---------- the far side of the glass (sky.js): every moving layer is transform-only ---------- */
+.layer { position: absolute; left: 0; top: 0; pointer-events: none; }
+.fill { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.mover { will-change: transform; transform-origin: 0 0; }
+#sky { position: absolute; inset: 0; }
+/* the frosted copy of the scene, cut to the pane shapes: it stands in for backdrop-filter */
+#frost { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+#edgeflash { z-index: 2; }   /* the storm's pane-edge flash sits over the room */
+.bare #window, .bare #activity { display: none; }   /* development only (sky.js ?bare) */
+
+/* ---------- layout: two console wings flank a clear window ----------
+   x 0-72 is scenery under the Dock; the window column is centred on the notch (x 756). */
+/* Layers (README 8a.5, measured with KilnWall --measure and footprint, notes.md). The room is
+   one stacking context. Every pane's glass paints into the root with the scene, which is a still
+   picture while nothing behind the glass moves. In the panes that change on every line (sessions,
+   agents, This Mac, I/O) only the contents (.pc, below) are a layer, so a figure repaints its
+   glyphs and nothing under them. While something behind the glass moves (frost live: drift,
+   rain, snow), the whole room becomes one layer. */
+.room { position: absolute; left: 72px; right: 10px; top: 44px; bottom: 10px; display: grid; z-index: 1;
+  grid-template-columns: 522px 1fr 584px; gap: var(--gap); }
+.scene-live .room { transform: translateZ(0); }
+/* contain: a figure changing in one pane re-lays-out that pane, not the room */
+.glass { z-index: 0; contain: layout paint; }
+/* At 100 and 200 ms a 60-120 ms glide cannot be seen, but it keeps the compositor drawing at
+   60 fps for most of every period: bars, cores and chart heads step with the data instead
+   (panes.js sets .snap; at 300 ms and slower they glide). */
+.snap .bar i, .snap .core .cap i, .snap .memstack i, .snap .chart > svg.head { transition: none; }
+#sessions, #agents, #compute, #io, #procs { z-index: 1; }
+/* A pane's contents sit in one inner box (.pc, made at mount by panes.js) over its glass. The
+   glass itself (tint, grain, sheen, edges, shadows) paints once into the root and never again;
+   in the panes that change on every line only .pc is a layer, transparent, so a changed figure
+   re-draws its glyphs and nothing under them. contain: strict makes .pc a layout root: a figure
+   changing re-lays-out its own pane, never the wings or the room. */
+.pc { position: absolute; inset: 0; padding: inherit; contain: strict; }
+#sessions > .pc, #agents > .pc, #compute > .pc, #io > .pc, #procs > .pc { transform: translateZ(0); }
+.wing { display: grid; gap: var(--gap); min-height: 0; align-content: start; grid-row: 1; }
+.wing.left { grid-column: 1; } .window { grid-column: 2; grid-row: 1; } .wing.right { grid-column: 3; }
+/* Sessions takes the height its rows need (--sh, set by panes.js when the count changes) and
+   Agents the rest, so one open session leaves its spare glass to the agents list, not to empty
+   space. 928 px in all; at two or four sessions the split is the old 268 / 294. */
+.wing.left { grid-template-rows: 262px 74px var(--sh, 268px) 1fr; height: 928px; transition: grid-template-rows 300ms ease; }
+.wing.right { grid-template-rows: 266px 176px 124px 332px; }
+
+.glass { position: relative; border-radius: 22px; padding: 14px 16px; min-height: 0; overflow: hidden;
+  background-color: var(--glass);
+  /* frosted glass has a tooth: a still 2x grain tile (panes.js, --grain) breaks up banding in the
+     upscaled frost and reads as material at viewing distance */
+  background-image: var(--grain, none); background-size: 64px 64px;
+  /* one light, overhead. Edges are half a css px, one device px at 2x: a lit top lip, a hairline
+     all round and a faint return of light at the foot; then a tight contact shadow and a short
+     one under the foot. Short: a 50 px cast shadow darkened the sky in every gutter and round
+     the window's figures (README, "No veils on the sky"). No blurred inset shadow: it is
+     re-rendered on every repaint inside a pane, and the hot panes repaint on every line. */
+  box-shadow: inset 0 0.5px 0 var(--glass-lit), inset 0 0 0 0.5px var(--glass-edge),
+    inset 0 -0.5px 0 var(--glass-foot),
+    0 2px 4px -1px rgba(0,0,0,0.35), 0 10px 14px -10px rgba(0,0,0,0.5); }
+.glass::before { /* the slab's thickness glowing just under the top edge, and the sheen falling off it */
+  content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  background: linear-gradient(180deg, var(--glass-thick), transparent 12px), linear-gradient(180deg, var(--sheen), transparent 34%); }
+.glass::after { /* specular line where the light catches the top edge, strongest mid-span; under
+  .pc (z -1), so it paints with the glass instead of rising into a layer of its own over it */
+  content: ""; position: absolute; left: 22px; right: 22px; top: 0; height: 0.5px; pointer-events: none; z-index: -1;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.8) 50%, transparent); }
+/* snow settles on the top edge of every pane */
+.snowy .glass { box-shadow: inset 0 2px 0 rgba(255,255,255,0.75), inset 0 0 0 1px var(--glass-edge),
+    0 -1px 3px rgba(255,255,255,0.5), 0 2px 4px -1px rgba(0,0,0,0.35), 0 10px 14px -10px rgba(0,0,0,0.5); }
+.hd { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.hd h2 { font: 650 15px/1.1 var(--text); color: var(--ink); letter-spacing: 0.005em; white-space: nowrap; }
+.hd .aside { font-size: 12.5px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.k { color: var(--ink-3); font-size: 12px; }
+.v { color: var(--ink); }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+.nowrap { white-space: nowrap; }
+
+/* ---------- weekly limit ---------- */
+.limit { display: grid; grid-template-columns: 168px minmax(0, 1fr); gap: 20px; align-items: start; }
+.facts { display: grid; gap: 9px; }
+.fact .big { font: 500 21px/1.05 var(--num); color: var(--ink); white-space: nowrap; }
+.fact .big small { font: 500 13px var(--text); color: var(--ink-2); margin-left: 3px; }
+.fact .k { display: block; margin-bottom: 2px; }
+.note { font-size: 12px; color: var(--ink-2); line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---------- needs you ---------- */
+.needs { display: grid; grid-template-columns: 44px 1fr; gap: 14px; align-items: center; height: 100%; }
+.needs .state { font: 650 17px/1.15 var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.needs .sub { color: var(--ink-2); font-size: 12.5px; margin-top: 3px; line-height: 1.35;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.needs .sub b { color: var(--ink); font-weight: 600; }
+#needs.warm { background: rgba(120, 72, 22, 0.62); box-shadow: inset 0 1px 0 rgba(255,214,160,0.5), inset 0 0 0 1px rgba(255,180,92,0.55),
+  0 0 28px -6px rgba(255,180,92,0.55), 0 10px 14px -10px rgba(0,0,0,0.5); }
+:root[data-theme="day"] #needs.warm { background: rgba(255, 226, 186, 0.82); }
+#needs .icon { width: 44px; height: 44px; }
+
+/* ---------- sessions and agents: rows keyed by id, placed by transform, never reflowed ---------- */
+.rows { position: relative; }
+/* no will-change: rows move only when a list reorders, and the transition lifts them for those 300 ms */
+.row { position: absolute; left: 0; right: 0; top: 0; transition: transform 300ms ease; }
+.srow { display: grid; grid-template-columns: 1fr 86px 146px 22px; gap: 12px; align-items: center;
+  height: 48px; border-top: 1px solid var(--hair); }
+.scol { display: grid; grid-template-columns: 1fr 86px 146px 22px; gap: 12px; padding: 0 0 5px; }
+.sname { font: 650 14px/1.15 var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.smeta { font-size: 12px; color: var(--ink-2); margin-top: 3px; display: flex; gap: 7px; align-items: center; white-space: nowrap; }
+/* a background (daemon-hosted) session: a quiet tag ahead of its state, fixed per row */
+.smeta .bgk { color: var(--ink-3); font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  border: 1px solid var(--hair); border-radius: 4px; padding: 0 4px; line-height: 14px; }
+.bar { height: 5px; border-radius: 3px; background: var(--track); overflow: hidden; margin-top: 5px; }
+.bar i { display: block; height: 100%; width: 100%; border-radius: 3px; transform-origin: 0 0; will-change: transform; transition: transform var(--glide);
+  background: linear-gradient(90deg, color-mix(in srgb, var(--claude) 55%, transparent), var(--claude)); }
+.bar.ice i { background: linear-gradient(90deg, color-mix(in srgb, var(--machine) 50%, transparent), var(--machine)); }
+.cnum { font: 500 15px/1 var(--num); white-space: nowrap; }
+.cnum small { color: var(--ink-3); font: 500 11px var(--text); margin-left: 3px; }
+/* the second band a row opens when two or fewer sessions are listed: same columns as the row */
+.sdet { display: grid; grid-template-columns: 1fr 86px 146px 22px; gap: 12px; height: 44px; padding-top: 2px;
+  opacity: 0; transition: opacity 300ms ease; pointer-events: none; }
+.roomy .sdet { opacity: 1; }
+.sdet .k { display: block; font-size: 11.5px; margin-bottom: 3px; }
+.sdet .dv { font: 500 14px/1.1 var(--num); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sdet > div:first-child .dv { font: 500 13px/1.15 var(--text); color: var(--ink-2); }
+.sdet .dv small { font: 500 11px var(--text); color: var(--ink-3); }
+.sdet .pmv { width: 1.86em; }                         /* "888", "9.9" */
+.sdet .ov { width: 2.06em; }                          /* CPU "88.8", "136" */
+.sdet > div:nth-child(3) { grid-column: 3 / 5; }
+.sdet .u2 { margin-left: 3px; }
+.sdet .memv { display: inline-block; width: 4.1em; }  /* "888 MB": the uptime after it stays put */
+.srow .ctxv { width: 2.32em; }                        /* "888k" */
+.srow .ov { width: 2.06em; }                          /* "88.8" */
+.rw { display: grid; grid-template-columns: auto 1.9em auto; gap: 0 4px; justify-content: start; }
+.rw .slot { text-align: right; }
+.rate { display: grid; grid-template-columns: 50px 1fr; align-items: center; gap: 8px; }
+.more { position: absolute; right: 0; bottom: 0; font-size: 12px; color: var(--ink-3); }
+
+.arow { display: grid; grid-template-columns: 1fr 116px; gap: 2px 12px; height: 46px; padding-top: 6px; border-top: 1px solid var(--hair); }
+.atype { font: 650 14px/1.15 var(--text); display: flex; gap: 7px; align-items: center; white-space: nowrap; overflow: hidden; }
+.atype .k { font-weight: 400; overflow: hidden; text-overflow: ellipsis; }
+.adesc { font-size: 12.5px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.age { font: 500 17px/1 var(--num); text-align: right; }
+/* one line per agent when more run than two-line rows can hold: type, task, age; the session
+   moves to the pane's header line when they share one */
+.arow.c { grid-template-columns: max-content minmax(0, 1fr) 64px; gap: 0 10px; height: 23px; padding-top: 0; align-items: center; }
+.arow.c .atype { font-size: 13px; }
+.arow.c .atype .k, .arow.c > :last-child { display: none; }
+.arow.c .adesc { grid-column: 2; grid-row: 1; }
+.arow.c .age { grid-column: 3; grid-row: 1; font-size: 14px; }
+.share { display: grid; grid-template-columns: 112px 1fr; gap: 10px; align-items: center; margin-top: 7px; }
+.sharebar { display: flex; height: 18px; border-radius: 6px; overflow: hidden; gap: 2px; }
+.sharebar i { display: flex; align-items: center; justify-content: center; height: 100%; font: 600 11px/1 var(--num);
+  font-style: normal; color: var(--on-fill); white-space: nowrap; overflow: hidden; flex: none; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); margin-top: 9px; }
+.legend span { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.flag { margin-top: 10px; padding: 8px 11px; border-radius: 12px; font-size: 12.5px; line-height: 1.4; color: var(--ink);
+  background: var(--flag-bg); box-shadow: inset 0 0 0 1px var(--flag-edge); }
+.flag.quiet { background: none; box-shadow: inset 0 0 0 1px var(--hair); color: var(--ink-2); }
+.flag b { color: var(--flag-ink); font-weight: 650; }
+.flag.quiet b { color: var(--ink); }
+.spawns { position: absolute; left: 16px; right: 16px; bottom: 14px; border-top: 1px solid var(--hair); padding-top: 9px; }
+
+/* ---------- the window: the real sky, with nothing laid over it ----------
+   README, Preferences, "No veils on the sky": no shade, plate or glow is put on the sky to help
+   the type, and the sky is the same picture in either appearance. The two figures, the clock and
+   the temperature, stand on it in the ink the sky allows: sky.js ink() reads the sky as painted
+   behind them and sets data-sky "dark" (white figures) or "light" (dark ones), with a 2 px halo
+   that hugs the glyphs. Where neither ink reaches Lc 60 there, each figure gets a pane of its own
+   (.figcard). The words (the date, the period, the sky in words and the readings) are on glass
+   always, cut from the same panes as the wings, in the theme's colours. */
+.window { position: relative; text-align: center; color: var(--wink); }
+.clock { position: absolute; left: -20px; right: -20px; top: 30px; font: 300 108px/0.9 var(--num); letter-spacing: -0.035em;
+  text-shadow: var(--wshadow); white-space: nowrap; }
+:root[data-sky="dark"] .window { --wink: #ffffff; --wshadow: 0 0 2px rgba(0,0,0,0.55); }
+:root[data-sky="light"] .window { --wink: #0a111c; --wshadow: 0 0 2px rgba(255,255,255,0.6); }
+/* a figure on its pane takes the pane's ink, as everything on glass does */
+.window.cards .clock, .window.cards .wx .temp { color: var(--ink); text-shadow: none; }
+/* window panes: the wings' glass (tint, grain, lip, hairline), cut smaller. sky.js layout() cuts
+   the frost to them as to the wings' panes. */
+.figcard, .slip, .wx .plate { background-color: var(--glass); background-image: var(--grain, none); background-size: 64px 64px;
+  border-radius: 16px; box-shadow: inset 0 0.5px 0 var(--glass-lit), inset 0 0 0 0.5px var(--glass-edge),
+  inset 0 -0.5px 0 var(--glass-foot), 0 2px 4px -1px rgba(0,0,0,0.35), 0 10px 14px -10px rgba(0,0,0,0.5); }
+.figcard { position: absolute; left: 0; right: 0; z-index: -1; display: none; pointer-events: none; }
+.window.cards .figcard { display: block; }
+.figcard.c { top: 22px; height: 112px; }
+.figcard.t { top: 214px; height: 84px; left: 52px; right: 52px; }
+.clock b { font-weight: inherit; }
+/* The minutes are tabular, so the clock holds still from minute to minute. The hour keeps
+   Red Hat's proportional figures: a tabular "1" at 108 px left a gap in "10" and pushed "pm"
+   to within 10 px of the tokens pane. It changes width at most once an hour. */
+.clock .hh { font-variant-numeric: proportional-nums !important; }
+.clock span { font-size: 25px; letter-spacing: 0; font-weight: 500; margin-left: 4px; }
+/* the slip: the date and the period readout, on a pane under the clock */
+.slip { position: absolute; left: 0; right: 0; top: 144px; height: 56px; padding: 9px 12px 0; color: var(--ink); }
+.date { font: 600 17px/1.2 var(--text); white-space: nowrap; }
+/* the temperature on the sky; under it the plate, a pane with the sky in words and the readings.
+   The event log takes the space below, down to the wings' foot, with the town seen through its frost */
+.wx { position: absolute; left: 0; right: 0; top: 222px; z-index: 0; }
+.wx .temp { font: 300 76px/0.9 var(--num); letter-spacing: -0.03em; text-shadow: var(--wshadow); }
+.wx .plate { margin: 18px 0 0; padding: 11px 14px 12px; text-align: left; color: var(--ink); }
+.wx .cond { font: 650 17px/1.2 var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wx .place { font-size: 12.5px; color: var(--ink-2); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  padding-bottom: 9px; border-bottom: 1px solid var(--hair); }
+.wx dl { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 8px; margin: 9px 0 0; }
+.wx dt { font-size: 11.5px; color: var(--ink-2); }
+.wx dd { font: 500 16px/1.15 var(--num); margin-top: 2px; white-space: nowrap; }
+.wx dd small { font: 500 11.5px var(--text); color: var(--ink-2); }
+/* the btop corner readout: the refresh period, and a dot that says data is flowing */
+.period { display: flex; justify-content: center; align-items: center; gap: 7px; margin-top: 6px;
+  font: 500 12.5px/1 var(--text); color: var(--ink-2); }
+/* the padding is room for the change highlight; the negative margin keeps the resting gap a word space */
+.period .pv { font: 600 13px/1 var(--num); padding: 3px 7px; margin-left: -5px; border-radius: 8px; }
+/* Rule 6: the dot beats on Kiln.onBeat (at most about once a second at any period), opacity
+   only, a soft 0.5 -> 1 -> 0.5 over 600 ms. Steady means lines are arriving; when they stop the
+   runtime sets html.kiln-stale and the dot goes grey and still.
+   It sits on the slip, so its green is the panes' own. A 1.5 px rim stays at full opacity so
+   the dot holds 3:1 at rest; the fill inside it (::before) beats. */
+.window { --wok: var(--ok); }
+.period .pulse { position: relative; width: 7px; height: 7px; border-radius: 50%; box-shadow: inset 0 0 0 1.5px var(--wok);
+  transition: opacity 400ms ease, box-shadow 400ms ease; }
+.period .pulse::before { content: ""; position: absolute; inset: 0; border-radius: 50%;
+  background: var(--wok); box-shadow: 0 0 6px color-mix(in srgb, var(--wok) 60%, transparent);
+  opacity: 0.5; transition: opacity 400ms ease, background-color 400ms ease;
+  will-change: opacity; }   /* a 7 px layer of its own: each beat would otherwise lift it out of the root and drop it back, twice a second */
+.period .pulse.b1::before { animation: beat1 600ms ease-in-out; }
+.period .pulse.b2::before { animation: beat2 600ms ease-in-out; }
+@keyframes beat1 { 0%, 100% { opacity: 0.5; } 45% { opacity: 1; } }
+@keyframes beat2 { 0%, 100% { opacity: 0.5; } 45% { opacity: 1; } }
+/* stale: one grey disc at 0.35, as before */
+.kiln-stale .period .pulse { opacity: 0.35; box-shadow: none; }
+.kiln-stale .period .pulse::before { animation: none; opacity: 1; background: var(--mute); box-shadow: none; }
+/* a period change lights the readout for 1.5 s, then fades in 0.3 s */
+.period.f1 .pv { animation: flag1 1.8s ease-in; }
+.period.f2 .pv { animation: flag2 1.8s ease-in; }
+@keyframes flag1 { 0%, 83% { background-color: var(--claude); color: var(--on-fill); text-shadow: none; } }
+@keyframes flag2 { 0%, 83% { background-color: var(--claude); color: var(--on-fill); text-shadow: none; } }
+
+/* ---------- recent activity: a pane in the window column, over the window, under the weather ---------- */
+/* one gutter (--gap) under the weather plate, down to the wings' foot: both wings are 928 px
+   tall (rows + gaps), so 928 - 514 puts its bottom edge on theirs. The town shows through the frost. */
+#activity { grid-column: 2; grid-row: 1; align-self: start; margin-top: 514px; height: 414px; }
+.erow { display: grid; grid-template-columns: 6px minmax(0, 1fr) auto; column-gap: 8px; align-items: center;
+  height: 39px; padding-top: 4px; border-top: 1px solid var(--hair); }
+/* the same session as the row above: its name steps back, so the eye runs down the events */
+.erow.same .ename { font-weight: 500; color: var(--ink-3); }
+.erow .dot { width: 6px; height: 6px; }
+.ename { font: 650 13px/1.15 var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.etime { font-size: 12px; color: var(--ink-3); white-space: nowrap; text-align: right; }
+.edesc { grid-column: 2 / -1; font-size: 12px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+
+/* ---------- tokens ---------- */
+.tokhero { display: flex; align-items: baseline; gap: 16px; white-space: nowrap; }
+/* sized for "88.8 k per min at 12:59 pm", so the minute-in-progress line never moves */
+.tokhero .hero { width: 234px; flex: none; }
+.tokhero .hero .slot { width: 2.06em; }
+.hero { font: 400 40px/0.95 var(--num); letter-spacing: -0.02em; white-space: nowrap; }
+.hero small { font: 500 14px var(--text); color: var(--ink-2); margin-left: 5px; letter-spacing: 0; }
+.charts2 { display: grid; grid-template-columns: 1fr 186px; gap: 18px; margin-top: 8px; }
+.today { display: grid; grid-template-columns: 1.1fr 1fr 0.9fr 1.1fr; gap: 12px; margin-top: 8px; padding-top: 9px; border-top: 1px solid var(--hair); }
+.today .n, .ghstats .n { font: 500 20px/1 var(--num); margin-top: 3px; white-space: nowrap; }
+.today .n small, .ghstats .n small { font: 500 12.5px var(--text); color: var(--ink-2); margin-left: 2px; }
+
+/* ---------- charts: a static frame (grid, axis numbers) under a clipped strip that scrolls ---------- */
+.chart { position: relative; }
+.chart > svg { position: absolute; left: 0; top: 0; }
+.clip { position: absolute; top: 0; overflow: hidden; }
+.clip > svg { position: absolute; top: 0; will-change: transform; }
+.chart > svg.head { will-change: transform; transition: transform var(--glide); }
+
+/* ---------- this Mac ---------- */
+/* minmax(0, …): a column never widens for its text, so nothing to its right is shoved */
+.compute { display: grid; grid-template-columns: minmax(0, 1fr) 132px 196px; gap: 16px; }
+.cores { display: grid; grid-template-columns: repeat(10, minmax(0, 1fr)); gap: 3px; align-items: start; }
+.core { display: grid; grid-template-columns: minmax(0, 1fr); justify-items: center; gap: 4px; min-width: 0; }
+.core .cap { width: 9px; border-radius: 5px; background: var(--track); position: relative; height: 74px; overflow: hidden; }
+/* the readings alternate between two rows: at a 13.5 px pitch, "100" beside "100" would touch */
+.core b { display: block; width: 1.9em; height: 22px; text-align: center; white-space: nowrap; }
+.core:nth-child(even) b { padding-top: 11.5px; }
+.split { display: flex; gap: 12px; white-space: nowrap; }
+.split .slot { width: 2.1em; }                        /* "88.8" in Atkinson; 100 drops the decimal */
+.ml { display: flex; justify-content: space-between; font-size: 11.5px; white-space: nowrap; }
+.ml .slot { width: 1.48em; }                          /* "9.9"; 10 GB and over drop the decimal */
+.cpuhero .slot { width: 2.06em; }                     /* "88.8"; 100 drops the decimal */
+.mid .slot { width: 2.06em; }
+.core .cap i { position: absolute; left: 0; right: 0; bottom: 0; height: 100%; border-radius: 5px; transform-origin: 50% 100%; will-change: transform; transition: transform var(--glide);
+  background: linear-gradient(0deg, color-mix(in srgb, var(--machine) 55%, transparent), var(--machine)); }
+.core b { font: 500 10.5px/1 var(--num); color: var(--ink-2); }
+.memstack { position: relative; height: 12px; border-radius: 4px; overflow: hidden; background: var(--track); margin: 6px 0 5px; }
+.memstack i { position: absolute; top: 0; height: 100%; left: 0; width: 100%; transform-origin: 0 0; will-change: transform; transition: transform var(--glide); }
+.levels { display: flex; gap: 3px; margin-top: 6px; }
+.levels span { flex: 1; text-align: center; padding: 3px 0 2px; border-radius: 6px; font-size: 11.5px; color: var(--ink-3);
+  box-shadow: inset 0 0 0 1px var(--hair); }
+.levels span.on { color: var(--on-fill); background: var(--ok); box-shadow: none; font-weight: 650; }
+.levels span.on.warn { background: var(--claude); }
+.levels span.on.critical { background: var(--alert); }
+.io { display: grid; grid-template-columns: 1.5fr 1fr 0.72fr; gap: 16px; height: 100%; }
+.io > div + div { border-left: 1px solid var(--hair); padding-left: 16px; }
+.mid { font: 500 22px/1 var(--num); white-space: nowrap; }
+.mid small { font: 500 12px var(--text); color: var(--ink-2); margin-left: 3px; }
+
+/* ---------- process lists (machine preset) and the fortnight (week preset) ---------- */
+.procs { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.proc { display: grid; grid-template-columns: 1fr 70px; gap: 8px; align-items: center; height: 25px; border-top: 1px solid var(--hair); font-size: 12.5px; }
+.proc span:first-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--ink-2); }
+.proc span:last-child { font: 500 14px/1 var(--num); text-align: right; }
+
+/* ---------- GitHub ---------- */
+.ghstats { display: grid; grid-template-columns: repeat(5, auto); justify-content: space-between; align-items: end; }
+.latest { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--hair); display: flex; justify-content: space-between; gap: 10px; font-size: 13px; white-space: nowrap; }
+.latest > span:first-child { overflow: hidden; text-overflow: ellipsis; }
+.latest b { font-weight: 650; }
+
+/* svg type and paint, all from the tokens so day glass recolours every chart */
+.axis { font: 500 10.5px var(--num); fill: var(--ink-3); }
+.axis.peak { fill: var(--ink-2); font-weight: 600; }
+.axis.hi { fill: var(--ink); font-weight: 600; }
+/* labels that sit inside a plot get a halo of the pane's own tone, so a line running through
+   "average 23.7k" or "today 1.3M" (seen on the live feed) does not cut the figures */
+.axis.peak, .axis.hi { paint-order: stroke; stroke: var(--halo); stroke-width: 3px; stroke-linejoin: round; }
+.ringnum { font: 300 60px var(--num); fill: var(--ink); letter-spacing: -0.03em; }
+.ringunit { font: 400 21px var(--num); fill: var(--ink-2); }
+.ringcap { font: 500 12px var(--text); fill: var(--ink-2); }
+.g0 { stroke: var(--grid-0); } .g1 { stroke: var(--grid); }
+.s-claude { stroke: var(--claude); } .f-claude { fill: var(--claude); }
+.s-machine { stroke: var(--machine); } .f-machine { fill: var(--machine); }
+.s-agent { stroke: var(--agent); } .f-agent { fill: var(--agent); }
+.s-ok { stroke: var(--ok); } .f-ok { fill: var(--ok); }
+.s-mute { stroke: var(--mute); } .f-mute { fill: var(--mute); }
+.s-track { stroke: var(--track); } .s-ink { stroke: var(--ink); } .f-ink { fill: var(--ink); } .f-mark { fill: var(--mark); } .s-mark { stroke: var(--mark); }
+.s-ref { stroke: var(--ink-2); opacity: 0.7; }
+
+/* Tabular figures everywhere, HTML and SVG. Every `font:` shorthand above resets
+   font-variant-numeric and font-feature-settings to normal (measured in WebKit: the CPU figure
+   computed "normal" under `.num`), so this one rule has to outrank them all. Both faces carry tnum. */
+body *, svg text { font-variant-numeric: tabular-nums !important; }
+
+/* presets */
+.p-focus .wing.left { grid-template-rows: 262px 74px; }
+.p-focus #sessions, .p-focus #agents, .p-focus .wing.right { display: none; }
+.p-machine #github { display: none; } .p-machine #procs { display: block; }
+.p-week #compute, .p-week #io { display: none; } .p-week #fortnight { display: block; }
+.p-week .wing.right { grid-template-rows: 266px 310px 332px; }
+#procs, #fortnight { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .row, .bar i, .core .cap i, .memstack i, .chart > svg.head { transition: none; }
+  .period .pulse.b1, .period .pulse.b2 { animation: none; }
+  .period .pulse { opacity: 1; }
+  /* the period highlight still shows for 1.5 s; it switches off instead of fading */
+  .period.f1 .pv, .period.f2 .pv { animation-duration: 1.5s; animation-timing-function: step-end; }
+}
+</style>
+</head>
+<body>
+<div id="world" class="fill"></div>
+
+<main class="room" id="room">
+  <section class="wing left">
+    <article class="glass" id="limit"></article>
+    <article class="glass" id="needs"></article>
+    <article class="glass" id="sessions"></article>
+    <article class="glass" id="agents"></article>
+  </section>
+
+  <section class="window" id="window"></section>
+  <article class="glass" id="activity"></article>
+
+  <section class="wing right">
+    <article class="glass" id="tokens"></article>
+    <article class="glass" id="compute"></article>
+    <article class="glass" id="io"></article>
+    <article class="glass" id="fortnight"></article>
+    <article class="glass" id="github"></article>
+    <article class="glass" id="procs"></article>
+  </section>
+</main>
+<div id="edgeflash" class="fill" style="opacity:0;display:none"></div>
+
+<script src="../_shared/kiln-runtime.js"></script>
+<script src="config.js"></script>
+<script src="sky.js"></script>
+<script src="panes.js"></script>
+</body>
+</html>

@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Bento Keynote</title>
+<style>
+@font-face { font-family: "Bricolage"; src: url("fonts/Bricolage.ttf") format("truetype"); font-weight: 200 800; font-stretch: 75% 100%; }
+@font-face { font-family: "Instrument Sans"; src: url("fonts/InstrumentSans-Variable.ttf") format("truetype"); font-weight: 400 700; font-stretch: 75% 100%; }
+
+/* Keynote dark. Contrast measured with palmath.py (APCA Lc on the lightest tile pixel #202024):
+   ink 99, ink-2 71, ink-3 63, calm 77, amber 78, cyan 78, failed 64. Violet and red are fills only. */
+:root {
+  --stage: radial-gradient(120% 90% at 50% -12%, #232327 0%, #121214 46%, #09090a 100%);
+  --tile: #161618;
+  --tile-hi: #202024;
+  --tile-shadow: inset 0 1px 0 rgba(255,255,255,0.10), inset 0 0 0 1px rgba(255,255,255,0.025),
+    0 1px 2px rgba(0,0,0,0.7), 0 16px 30px -12px rgba(0,0,0,0.95);
+  --ink: #f5f5f7;
+  --ink-2: #c8c8ce;
+  --ink-3: #b9b9bf;
+  --hair: rgba(255,255,255,0.09);
+  --track: rgba(255,255,255,0.09);
+  --grid: rgba(255,255,255,0.08);
+  --grid-0: rgba(255,255,255,0.2);
+  --ref: rgba(255,255,255,0.5);
+  --band-a: rgba(255,255,255,0.055);
+  --band-b: rgba(255,255,255,0.035);
+  --burn-0: #ffd27a; --burn-1: #ff9a52; --burn-2: #ff5e8a;
+  --flow-0: #6ae3ff; --flow-1: #8f7cff;
+  --calm: #5eeaa0;
+  --amber: #ffcb70;
+  --red: #ff6a5c;
+  --failed: #ffa396;
+  --cyan: #6ae3ff;
+  --violet: #8f7cff;
+  --idle: #b9b9bf;
+  --axis-burn: #ffc27a;
+  --bar-dim: rgba(255,255,255,0.55);
+  --bar-today: rgba(255,255,255,0.22);
+  --spark-idle: #6e6e75;
+  --head: #fff;
+  --pill-ink: #06150d;
+  --amber-wash: rgba(255,203,112,0.16);
+  --mem-w: #a9ecff; --mem-c: #4aa6c4;
+  /* GitHub levels run along the flow gradient: lightness climbs with the count */
+  --gh0: rgba(255,255,255,0.07); --gh1: #322d74; --gh2: #5b50d2; --gh3: #8f7cff; --gh4: #6ae3ff;
+  --hero: "Bricolage", ui-sans-serif, sans-serif;
+  --text: "Instrument Sans", ui-sans-serif, sans-serif;
+}
+/* Keynote light: the config's "auto" theme pins it between sunrise and sunset; with nothing
+   pinned, the system scheme decides. Accents darkened for white (APCA Lc on #fff): ink-3 86,
+   calm 76, amber 77, red 76, cyan 73, violet 80, burn 63-72, flow 68-80. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --stage: radial-gradient(120% 90% at 50% -12%, #ffffff 0%, #ececf0 50%, #dcdce2 100%);
+    --tile: #ffffff; --tile-hi: #ffffff;
+    --tile-shadow: inset 0 0 0 1px rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.08), 0 16px 30px -14px rgba(20,20,40,0.22);
+    --ink: #111114; --ink-2: #44444c; --ink-3: #55555d;
+    --hair: rgba(0,0,0,0.08); --track: rgba(0,0,0,0.08); --grid: rgba(0,0,0,0.08); --grid-0: rgba(0,0,0,0.25); --ref: rgba(0,0,0,0.45);
+    --band-a: rgba(0,0,0,0.045); --band-b: rgba(0,0,0,0.025);
+    --burn-0: #c27400; --burn-1: #d9531f; --burn-2: #d42a6a; --flow-0: #0a86b0; --flow-1: #5b45e0;
+    --calm: #0b7a45; --amber: #9a5b00; --red: #c4302b; --failed: #c4302b; --cyan: #0a7a9e; --violet: #5b45e0; --idle: #6e6e76;
+    --axis-burn: #a85a00; --bar-dim: rgba(0,0,0,0.45); --bar-today: rgba(0,0,0,0.16); --spark-idle: #a0a0a8; --head: #111114;
+    --pill-ink: #ffffff; --amber-wash: rgba(255,170,40,0.14); --mem-w: #7cc8e0; --mem-c: #075a75;
+    --gh0: rgba(0,0,0,0.06); --gh1: #d6d0ff; --gh2: #a497ff; --gh3: #6b5cf0; --gh4: #08617f;
+  }
+}
+:root[data-theme="light"] {
+  --stage: radial-gradient(120% 90% at 50% -12%, #ffffff 0%, #ececf0 50%, #dcdce2 100%);
+  --tile: #ffffff; --tile-hi: #ffffff;
+  --tile-shadow: inset 0 0 0 1px rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.08), 0 16px 30px -14px rgba(20,20,40,0.22);
+  --ink: #111114; --ink-2: #44444c; --ink-3: #55555d;
+  --hair: rgba(0,0,0,0.08); --track: rgba(0,0,0,0.08); --grid: rgba(0,0,0,0.08); --grid-0: rgba(0,0,0,0.25); --ref: rgba(0,0,0,0.45);
+  --band-a: rgba(0,0,0,0.045); --band-b: rgba(0,0,0,0.025);
+  --burn-0: #c27400; --burn-1: #d9531f; --burn-2: #d42a6a; --flow-0: #0a86b0; --flow-1: #5b45e0;
+  --calm: #0b7a45; --amber: #9a5b00; --red: #c4302b; --failed: #c4302b; --cyan: #0a7a9e; --violet: #5b45e0; --idle: #6e6e76;
+  --axis-burn: #a85a00; --bar-dim: rgba(0,0,0,0.45); --bar-today: rgba(0,0,0,0.16); --spark-idle: #a0a0a8; --head: #111114;
+  --pill-ink: #ffffff; --amber-wash: rgba(255,170,40,0.14); --mem-w: #7cc8e0; --mem-c: #075a75;
+  --gh0: rgba(0,0,0,0.06); --gh1: #d6d0ff; --gh2: #a497ff; --gh3: #6b5cf0; --gh4: #08617f;
+}
+
+* { box-sizing: border-box; margin: 0; }
+html, body { width: 100%; height: 100%; overflow: hidden; }
+body { background: var(--stage); font-family: var(--text); color: var(--ink); font-size: 13px; line-height: 1.3; position: relative;
+  -webkit-font-smoothing: antialiased; }
+/* Rule 13: every figure is tabular, SVG text included. Set on every element, not inherited from
+   body, because the `font` shorthand (.k, .t, .axis, .mn ...) resets font-variant-numeric: 25
+   figures ran proportional that way (dev-audit, 2026-11-05). Both faces carry a real tnum. */
+*, ::before, ::after { font-variant-numeric: tabular-nums !important; }
+/* A figure slot: its width is the widest value it normally shows (min-width, so a rare wider
+   value grows it instead of overlapping), right-aligned, so the unit after it stays put. */
+.fx { display: inline-block; text-align: right; white-space: nowrap; }
+/* facts under a small tile: label and figure per cell, fixed columns, so no figure pushes another */
+.cells { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr) minmax(0, 0.85fr); column-gap: 6px; white-space: nowrap; }
+.cells.two { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.cells.eq { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+/* Hero slots, each the width of the widest value its format normally gives, so the figure's
+   left edge stays near the title's: two figures ("8.8", "17": CPU, battery), three ("999": rates,
+   disk), or "88.8" (memory). Bricolage tabular digits are 0.38em here, the point 0.13em. */
+.h4 .hx { min-width: 0.9em; }
+.h4 .hx.w3 { min-width: 1.15em; }
+.h4 .hx.w4 { min-width: 1.28em; }
+.h4 .hx.w2 { min-width: 0.77em; }
+#mem-bar > i { position: absolute; left: 0; top: 0; width: 100%; height: 100%; transform-origin: 0 50%; transform: scaleX(0); }
+svg { display: block; overflow: visible; }
+svg.clip { overflow: hidden; }
+/* Motion runs on the compositor (README 8a). The page sets a new transform or opacity once per
+   feed line and a CSS transition carries it, so the runtime draws no frames for it.
+   --kiln-tween is 60% of the period (at most 400 ms), so motion lands before the next line.
+   --out is the runtime's ease-out cubic. */
+:root { --out: cubic-bezier(0.33, 1, 0.68, 1); }
+.tw { transition: transform var(--kiln-tween) var(--out); will-change: transform; }
+
+/* scrolling sparklines: the SVG's viewBox walks along a path drawn in time coordinates, in whole
+   device pixels (bento.js scrollSpark). No layer and no transform: a transform written per line
+   re-ran WebKit's compositing pass over the whole page. */
+.spk { overflow: hidden; position: relative; flex: none; }
+.spk > svg { position: absolute; left: 0; top: 0; }
+img, canvas { max-width: 100%; }
+
+/* x 0-66 is the Dock's; nothing but stage sits there. The menu bar auto-hides, so the grid
+   starts just below the notch (y 32) and every word inside a tile sits below y 60. */
+.bento { position: absolute; left: 70px; right: 10px; top: 44px; bottom: 10px; display: grid; gap: 8px;
+  grid-template-columns: repeat(12, minmax(0, 1fr)); grid-template-rows: repeat(7, minmax(0, 1fr));
+  grid-template-areas:
+    "A A A A B B B B C C C C"
+    "A A A A B B B B C C C C"
+    "A A A A D D D D F F U U"
+    "E E E E D D D D F F V V"
+    "E E E E D D D D F F W W"
+    "H H H H H H I I P P Y Y"
+    "H H H H H H I I P P Z Z"; }
+#A { grid-area: A; } #B { grid-area: B; } #C { grid-area: C; } #D { grid-area: D; } #E { grid-area: E; }
+#F { grid-area: F; } #U { grid-area: U; } #V { grid-area: V; } #W { grid-area: W; } #H { grid-area: H; }
+#I { grid-area: I; } #P { grid-area: P; } #Y { grid-area: Y; } #Z { grid-area: Z; } #G { grid-area: G; } #T { grid-area: T; }
+#G, #T { display: none; }
+
+/* presets (config.js): the calendar takes the top row */
+:root[data-layout="github"] .bento { grid-template-areas:
+    "H H H H H H I I C C C C"
+    "H H H H H H I I C C C C"
+    "A A A A B B B B F F U U"
+    "A A A A B B B B F F V V"
+    "A A A A D D D D F F W W"
+    "E E E E D D D D P P Y Y"
+    "E E E E D D D D P P Z Z"; }
+/* the small tiles become the machine: GPU and top processes replace 14 days and agents */
+:root[data-layout="machine"] .bento { grid-template-areas:
+    "A A A A B B B B C C C C"
+    "A A A A B B B B C C C C"
+    "A A A A D D D D T T U U"
+    "E E E E D D D D T T V V"
+    "E E E E D D D D T T W W"
+    "H H H H H H I I G G Y Y"
+    "H H H H H H I I G G Z Z"; }
+:root[data-layout="machine"] #F, :root[data-layout="machine"] #P { display: none; }
+:root[data-layout="machine"] #G, :root[data-layout="machine"] #T { display: block; }
+/* four tiles only, larger */
+:root[data-layout="focus"] .bento { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: repeat(2, minmax(0, 1fr));
+  grid-template-areas: "A B" "D C"; gap: 12px; }
+:root[data-layout="focus"] .tile:not(#A):not(#B):not(#C):not(#D) { display: none; }
+:root[data-layout="focus"] :is(#A, #B, #D) { display: flex; flex-direction: column; justify-content: center; align-items: center; }
+:root[data-layout="focus"] :is(#A, #B, #D) > .zoom { zoom: 1.14; width: 434px; }
+
+/* contain: a tile's size comes from the grid, never from its text, so a figure that changes
+   lays out its own tile only, not the page */
+.tile { position: relative; overflow: hidden; border-radius: 24px; padding: 17px 19px; min-height: 0; min-width: 0;
+  background: linear-gradient(180deg, var(--tile-hi), var(--tile) 55%); box-shadow: var(--tile-shadow); contain: strict; }
+.tile.sm { padding: 14px 16px; border-radius: 20px; }
+.col { display: flex; flex-direction: column; height: 100%; }
+.t { font: 600 14px/1.2 var(--text); color: var(--ink-2); white-space: nowrap; }
+.t b { color: var(--ink); font-weight: 600; }
+.sub { font: 500 13.5px/1.35 var(--text); color: var(--ink-2); }
+.sub b { color: var(--ink); font-weight: 600; }
+.k { font: 500 12px/1.3 var(--text); color: var(--ink-3); }
+.ell { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* hero numerals: condensed, heavy, display optical size, tabular */
+.h { font-family: var(--hero); font-weight: 700; font-stretch: 75%; font-variation-settings: "opsz" 96; letter-spacing: -0.02em; line-height: 0.86;
+  font-feature-settings: "tnum" 1, "lnum" 1; white-space: nowrap; }
+.h small { font-size: 0.42em; font-weight: 600; letter-spacing: 0; margin-left: 0.06em; }
+.grad-burn { background: linear-gradient(100deg, var(--burn-0) 0%, var(--burn-1) 45%, var(--burn-2) 100%); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.grad-flow { background: linear-gradient(100deg, var(--flow-0) 0%, var(--flow-1) 100%); -webkit-background-clip: text; background-clip: text; color: transparent; }
+/* One hero scale, by the tile's job: 172 the weekly figure (A, the signature), 112 needs-you,
+   88 the four-column feature tiles (clock, tokens), 58 the table tiles' counts (sessions,
+   contributions), 44 every two-column tile, 28 a secondary figure under a hero (.fact .n). */
+.h2 { font-size: 88px; }
+.h3 { font-size: 58px; }
+.h4 { font-size: 44px; }
+.h5 { font-size: 28px; }
+
+.axis { font: 600 11px var(--text); fill: var(--ink-3); }
+.axis.hi { fill: var(--ink); }
+.axis.burn { fill: var(--axis-burn); }
+.ln-grid { stroke: var(--grid); }
+.ln-grid0 { stroke: var(--grid-0); }
+.ln-ref { stroke: var(--ref); stroke-dasharray: 3 4; }
+.band-a { fill: var(--band-a); } .band-b { fill: var(--band-b); }
+/* a label that sits over a trace keeps a ring of tile colour, so the line never runs through it */
+.axis.halo { paint-order: stroke; stroke: var(--tile); stroke-width: 4px; stroke-linejoin: round; }
+
+.row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.heroline { display: flex; align-items: flex-end; }
+.facts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+.fact .n { font: 700 28px/1 var(--hero); font-stretch: 80%; font-variation-settings: "opsz" 48; margin-top: 4px; white-space: nowrap; }
+.fact .n small { font: 600 12.5px var(--text); color: var(--ink-2); margin-left: 3px; }
+.fact .n small.u { margin: 0 3px 0 1px; }
+
+.li { display: grid; align-items: center; gap: 10px; padding: 8px 0; border-top: 1px solid var(--hair); }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+.nm { font: 600 14px/1.15 var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mn { font: 700 19px/1 var(--hero); font-stretch: 80%; font-variation-settings: "opsz" 36; text-align: right; white-space: nowrap; }
+.mn small { font: 600 11px var(--text); color: var(--ink-3); margin-left: 2px; }
+/* table units sit in fixed slots, so figures in a column share one right edge: "411" lines up
+   with the digits of "37.4 k", and "9%" with "35%" */
+.mn small.uk { display: inline-block; min-width: 0.95em; text-align: left; }
+.mn small.up { display: inline-block; min-width: 2.45em; text-align: right; }
+.bar { height: 5px; border-radius: 3px; background: var(--track); overflow: hidden; margin-top: 5px; }
+.bar i { display: block; height: 100%; border-radius: 3px; transform-origin: 0 50%;
+  transition: transform var(--kiln-tween) var(--out); will-change: transform; }
+.fill-burn { background: linear-gradient(90deg, var(--burn-0), var(--burn-1) 45%, var(--burn-2)); }
+.fill-cyan { background: var(--cyan); }
+.pill { display: inline-block; padding: 3px 9px 2px; border-radius: 99px; font: 650 12px/1.2 var(--text); color: var(--pill-ink); background: var(--calm); }
+.pill.warn { background: var(--amber); } .pill.critical { background: var(--red); }
+
+/* state colours, used by dots, labels and sparklines */
+.st-working { --st: var(--calm); } .st-background { --st: var(--cyan); } .st-idle { --st: var(--idle); }
+.st-waiting { --st: var(--amber); } .st-failed { --st: var(--failed); }
+/* a background (daemon-hosted) session: a quiet tag ahead of its model, fixed per row */
+.bgk { font: 600 10px/1 var(--text); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3);
+  border: 1px solid var(--hair); border-radius: 4px; padding: 1px 4px; margin-right: 6px; vertical-align: 1px; }
+.st-dot { background: var(--st); } .st-ink { color: var(--st); font-weight: 600; }
+
+/* sessions and agents: keyed rows in fixed slots, entering and leaving by opacity only.
+   A new row fades in from 0 once (li-in); a reorder or an exit is a transition. */
+.slots { position: relative; }
+.slots > .li { position: absolute; left: 0; right: 0; top: 0; will-change: transform, opacity;
+  transition: transform 300ms var(--out), opacity 300ms var(--out); animation: li-in 300ms var(--out) backwards; }
+@keyframes li-in { from { opacity: 0; } }
+.empty { position: absolute; left: 0; right: 0; top: 0; padding: 10px 0; border-top: 1px solid var(--hair); }
+/* D's free slots: the newest session events from the log, one line each, under the live rows.
+   The block follows the row count by transform; its rows are keyed like the sessions. History
+   wears a ring, a live session a filled dot. */
+.ss-ev { position: absolute; left: 0; right: 0; top: 0; border-top: 1px solid var(--hair);
+  transition: transform 300ms var(--out), opacity 300ms var(--out); }
+.ss-ev > .ev { position: absolute; left: 0; right: 0; top: 0; display: grid; grid-template-columns: 15px minmax(0, 1fr) 76px;
+  align-items: center; height: 24px; font: 500 12.5px/1 var(--text); color: var(--ink-2);
+  transition: transform 300ms var(--out), opacity 300ms var(--out); animation: li-in 300ms var(--out) backwards; }
+.ss-ev .ev b { color: var(--ink); font-weight: 600; }
+.ss-ev .ev .ring { width: 8px; height: 8px; border-radius: 50%; box-shadow: inset 0 0 0 1.5px var(--st); }
+.ss-ev .ev .ago { text-align: right; color: var(--ink-3); white-space: nowrap; }
+/* I: the newest GitHub events, two lines each, keyed by time like the agents */
+#gt-list > .ge { position: absolute; left: 0; right: 0; top: 0; transition: transform 300ms var(--out), opacity 300ms var(--out);
+  animation: li-in 300ms var(--out) backwards; }
+
+/* B: the amber wash sits under the content and only ever cross-fades */
+#B .wash { position: absolute; inset: 0; pointer-events: none; opacity: 0;
+  background: radial-gradient(120% 120% at 10% 0%, var(--amber-wash), transparent 70%); box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--amber) 40%, transparent); }
+#B .face { position: absolute; left: 19px; right: 19px; top: 45px; display: flex; align-items: flex-end; gap: 20px; }
+#B .face.wait { opacity: 0; }
+/* the one attention moment: a 400 ms cross-fade to amber when a session waits, and back */
+#B .wash, #B .face, #B .wait-run { transition: opacity 400ms var(--out); }
+#B .wait-run { opacity: 0; }
+#B.waiting .wash, #B.waiting .face.wait, #B.waiting .wait-run { opacity: 1; }
+#B.waiting .face.calm { opacity: 0; }
+#B .title { font: 600 25px/1.15 var(--text); }
+#B .ask { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.calm-ink { color: var(--calm); } .amber-ink { color: var(--amber); }
+
+/* C: the weather tile is a window onto the real sky, set into the stage. Nothing is laid over
+   the sky (README, Preferences, "No veils on the sky"): it is the same picture in either
+   appearance. The two figures stand on it in the ink the sky allows (weather.js ink()); the
+   words sit on the sill, a card in the theme's tile colours, as the other tiles are. */
+#C { padding: 0; box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 1px 2px rgba(0,0,0,0.7), 0 16px 30px -12px rgba(0,0,0,0.95); }
+#C .wx { position: absolute; inset: 0; overflow: hidden; border-radius: inherit; background: #0b1222; }
+#C .wx > * { position: absolute; left: 0; top: 0; pointer-events: none; }
+/* texture strips are wider than the window on purpose (they wrap by translate) */
+#C .wx > canvas { max-width: none; }
+#C .over { position: absolute; inset: 0; padding: 18px 22px 8px; display: flex; flex-direction: column; justify-content: space-between; z-index: 1; }
+/* a figure on the sky: white or near-black from the sky behind it, with a 2 px halo that hugs
+   the glyphs. Where neither ink reaches Lc 60 there, it sits on a card (.card). The padding is
+   always there and the margin takes it back, so a figure never moves when its card comes. */
+#C .nb { padding: 3px 10px 6px; margin: -3px -10px -6px; border-radius: 14px; color: #fff; text-shadow: 0 0 2px rgba(0,0,0,0.55); }
+#C .nb[data-ink="dark"] { color: #111114; text-shadow: 0 0 2px rgba(255,255,255,0.6); }
+#C .nb.card { color: var(--ink); text-shadow: none; background: var(--tile-hi);
+  box-shadow: inset 0 0 0 1px var(--hair), 0 1px 2px rgba(0,0,0,0.3); }
+/* the sill: the date, the sky in words and the readings, on a card inset 8 px from the window's
+   edge (its radius is the window's less the inset) */
+#C .sill { margin: 0 -14px; padding: 9px 14px 10px; border-radius: 16px; background: var(--tile-hi); color: var(--ink);
+  box-shadow: inset 0 0 0 1px var(--hair), 0 1px 2px rgba(0,0,0,0.35); }
+#C .sill-hd { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; white-space: nowrap;
+  font: 500 13.5px/1.2 var(--text); padding-bottom: 7px; margin-bottom: 7px; border-bottom: 1px solid var(--hair); }
+#C .sill-hd b { font-weight: 650; margin-right: 5px; }
+#C .sill-hd > span { overflow: hidden; text-overflow: ellipsis; }
+/* fixed columns sized for the widest reading (88 mph WSW, 100%, 88.8 mm, 12:59 am), so a new
+   wind speed never shoves humidity and the rest along; proportioned so typical readings sit at
+   even gaps */
+.wxrow { display: grid; grid-template-columns: minmax(0, 1.49fr) minmax(0, 0.78fr) minmax(0, 0.82fr) minmax(0, 1fr) minmax(0, 1fr); column-gap: 12px; }
+.wxrow div { font: 500 12px var(--text); color: var(--ink-2); white-space: nowrap; }
+.wxrow b { display: block; font: 700 19px/1 var(--hero); font-stretch: 80%; color: var(--ink); margin-top: 3px; }
+
+.swatch { width: 10px; height: 10px; border-radius: 2.5px; display: inline-block; }
+
+/* the period readout, btop's corner: quiet, legible, lit for 1.5 s when the period changes */
+#period { position: absolute; right: 12px; top: 12px; display: flex; align-items: center; gap: 6px; padding: 2px 8px 2px 7px;
+  border-radius: 99px; font: 600 11.5px/1.3 var(--text); color: var(--ink-3); }
+/* The dot rests at half and beats to full on Kiln.onBeat (bento.js), about once a second at any
+   period: a steady soft pulse means lines are flowing. When they stop (html.kiln-stale) it greys
+   out and stays down. Opacity only, on its own small layer. */
+#period .pd { width: 6px; height: 6px; border-radius: 50%; background: var(--calm); opacity: 0.5; will-change: opacity;
+  transition: opacity 600ms var(--out), background-color 600ms var(--out); }
+html.kiln-stale #period .pd { opacity: 0.2; background: var(--ink-3); }
+#period .hl { position: absolute; inset: 0; border-radius: inherit; background: var(--amber); opacity: 0; z-index: -1;
+  transition: opacity 300ms var(--out); }
+#period.lit .hl { opacity: 0.35; transition: none; }
+#period.lit { color: var(--ink); }
+
+/* screen-share preset: names and questions are replaced before they are written; this is the backstop */
+:root.private .priv { visibility: hidden; }
+
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+<script src="config.js"></script>
+<script src="../_shared/kiln-runtime.js"></script>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-burn" x1="0" x2="1"><stop offset="0" style="stop-color:var(--burn-0)"/><stop offset="1" style="stop-color:var(--burn-2)"/></linearGradient>
+    <linearGradient id="g-flow" x1="0" x2="1"><stop offset="0" style="stop-color:var(--flow-0)"/><stop offset="1" style="stop-color:var(--flow-1)"/></linearGradient>
+    <linearGradient id="g-flow-v" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--flow-1)"/><stop offset="1" style="stop-color:var(--flow-0)"/></linearGradient>
+    <linearGradient id="g-flow-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7f9cff" stop-opacity="0.5"/><stop offset="1" stop-color="#7f9cff" stop-opacity="0"/></linearGradient>
+    <linearGradient id="g-cyan-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" style="stop-color:var(--cyan)" stop-opacity="0.38"/><stop offset="1" style="stop-color:var(--cyan)" stop-opacity="0"/></linearGradient>
+  </defs>
+</svg>
+
+<div id="period" title="refresh period"><span class="hl"></span><span class="pd"></span><span id="period-ms"></span></div>
+
+<main class="bento">
+  <!-- A: weekly limit, the biggest tile -->
+  <section class="tile" id="A"><div class="zoom">
+    <div class="row"><span class="t"><b>Weekly limit</b></span><span class="t">resets <b id="wk-reset"></b></span></div>
+    <div class="heroline" style="gap:18px;margin-top:10px">
+      <div class="h grad-burn" style="font-size:172px;margin-left:-6px"><span id="wk-pct"></span><small>%</small></div>
+      <div style="padding-bottom:16px">
+        <div class="sub" style="font-size:18px;color:var(--ink)">used of this week</div>
+        <div class="sub" style="margin-top:5px">resets in <b id="wk-left"></b></div>
+      </div>
+    </div>
+    <svg id="wk-svg" width="434" height="104" viewBox="0 0 434 104" style="margin-top:16px"></svg>
+    <div class="facts" style="margin-top:14px">
+      <div class="fact"><span class="k">Burn rate, recent</span><div class="n"><span id="wk-burn"></span><small>% per hour</small></div></div>
+      <div class="fact"><span class="k">Forecast</span><div class="n" id="wk-fc"></div><div class="k" id="wk-fc-k" style="margin-top:3px"></div></div>
+      <div class="fact" id="wk-five-f" style="visibility:hidden"><span class="k">Five-hour window</span><div class="n" id="wk-five"></div><div class="k" id="wk-five-k" style="margin-top:3px"></div></div>
+    </div>
+  </div></section>
+
+  <!-- B: needs you, with how fast you usually answer -->
+  <section class="tile" id="B"><div class="wash" id="nd-wash"></div><div class="zoom" style="position:relative;height:100%">
+    <div class="row" style="position:relative"><span class="t"><b>Needs you</b></span><span class="t" id="nd-others"></span></div>
+    <div class="face calm" id="nd-calm" style="left:0;right:0;top:28px">
+      <div class="h calm-ink" style="font-size:112px">0</div>
+      <div style="padding-bottom:10px;min-width:0"><div class="title">Nothing is waiting on you</div>
+        <div class="sub" id="nd-last" style="margin-top:4px"></div></div>
+    </div>
+    <div class="face wait" id="nd-wait" style="left:0;right:0;top:28px">
+      <div class="h amber-ink" style="font-size:112px" id="nd-n"></div>
+      <div style="padding-bottom:10px;min-width:0"><div class="title">Waiting on you, <span id="nd-for" class="amber-ink"></span></div>
+        <div class="sub ask" id="nd-ask" style="margin-top:4px"></div></div>
+    </div>
+    <div style="position:absolute;left:0;right:0;bottom:0">
+      <div class="row"><span class="k" id="nd-strip-k"></span><span class="k" id="nd-today"></span></div>
+      <svg id="nd-svg" width="434" height="46" viewBox="0 0 434 46" style="margin-top:4px"></svg>
+    </div>
+  </div></section>
+
+  <!-- C: weather, a lit window -->
+  <section class="tile" id="C">
+    <div class="wx" id="wx"></div>
+    <div class="over">
+      <div class="row" style="align-items:flex-start">
+        <div class="h h2 nb" id="wx-nb-clock"><span id="wx-clock"></span><small id="wx-ampm" style="font-size:32px"></small></div>
+        <div class="h h2 nb" id="wx-nb-temp"><span id="wx-f"></span>°</div>
+      </div>
+      <div class="sill">
+      <div class="sill-hd"><span id="wx-date"></span><span><b id="wx-text"></b><span id="wx-place"></span></span></div>
+      <div class="wxrow">
+        <div>Wind<b id="wx-wind"></b></div>
+        <div>Humidity<b id="wx-hum"></b></div>
+        <div id="wx-plab">Precip.<b id="wx-precip"></b></div>
+        <div>Sunset<b id="wx-set"></b></div>
+        <div>Sunrise<b id="wx-rise"></b></div>
+      </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- D: sessions, with today's totals at the foot -->
+  <section class="tile" id="D"><div class="zoom col">
+    <!-- the count is interactive sessions running (working, waiting on you, or waiting on their
+         agents); the line under it says which; background sessions are counted apart, right -->
+    <div class="row" style="align-items:flex-end"><div class="heroline" style="gap:12px"><div class="h h3" id="ss-n"></div>
+      <div style="padding-bottom:3px"><div class="sub" id="ss-lab" style="font-size:15px;color:var(--ink)"></div>
+        <div class="k" id="ss-how" style="margin-top:3px;color:var(--ink-2)"></div></div></div>
+      <div class="k" id="ss-bg" style="text-align:right;padding-bottom:3px;line-height:1.35"></div></div>
+    <div class="li ss-cols" style="border:0;padding:12px 0 3px"><span class="k">Session</span><span class="k" style="text-align:right">Context</span>
+      <span class="k" style="display:flex;justify-content:space-between;white-space:nowrap"><span>15 min</span><span>hour, to <span class="fx" id="ss-scale" style="min-width:2.65em"></span></span></span><span class="k" style="text-align:right">Ag.</span></div>
+    <div class="slots" id="ss-rows" style="height:196px"></div>
+    <div style="border-top:1px solid var(--hair);margin-top:auto;padding-top:10px">
+      <div class="row"><span class="t"><b>Today</b>, since midnight</span><span class="k">cache hit <span id="td-hit"></span>, 14 days <span id="td-hit14"></span></span></div>
+      <div style="display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:12px;margin-top:9px;align-items:end">
+        <div class="fact"><div class="n grad-flow"><span id="td-out"></span><small id="td-out-u" class="u" style="color:inherit"></small></div><div class="k" style="margin-top:4px">output tokens</div></div>
+        <div class="fact"><div class="n"><span id="td-cache"></span><small id="td-cache-u" class="u"></small></div><div class="k" style="margin-top:4px">cache reads</div></div>
+        <div class="fact"><div class="n" id="td-calls"></div><div class="k" style="margin-top:4px">API calls</div></div>
+      </div>
+    </div>
+  </div></section>
+
+  <!-- E: output flow -->
+  <section class="tile" id="E">
+    <div class="row"><span class="t"><b>Output tokens</b> per minute</span><span class="t">last hour</span></div>
+    <div class="heroline" style="gap:14px;margin-top:8px">
+      <div class="h h2 grad-flow"><span class="fx" id="tk-last" style="min-width:0.9em"></span><small id="tk-last-u" style="display:inline-block;min-width:0.8em"></small></div>
+      <div class="sub" style="padding-bottom:6px">the last full minute, <span id="tk-at"></span><br>this minute so far, <span id="tk-so"></span></div>
+    </div>
+    <svg id="tk-svg" class="clip" width="472" height="140" viewBox="0 0 472 140" style="position:absolute;left:0;bottom:0"></svg>
+  </section>
+
+  <!-- F: agents, with the general-purpose flag -->
+  <section class="tile" id="F"><div class="col">
+    <div class="row"><span class="t"><b>Agents</b></span></div>
+    <div class="heroline" style="gap:10px;margin:8px 0 8px"><div class="h h4" id="ag-n"></div><div class="sub" id="ag-lab" style="padding-bottom:3px;color:var(--ink)"></div></div>
+    <div class="slots" id="ag-rows" style="height:141px"></div>
+    <div style="border-top:1px solid var(--hair);padding-top:9px;margin-top:auto">
+      <div style="display:flex;align-items:flex-end;gap:9px"><div class="fact"><div class="n" id="gp-pct-box" style="margin:0"><span class="fx" id="gp-pct" style="min-width:0.78em"></span><small style="margin-left:1px">%</small></div></div>
+        <div class="k" style="min-width:0;line-height:1.3"><div class="ell" id="gp-line" style="color:var(--ink-2)"></div><div class="ell" id="gp-from"></div><div class="ell" id="gp-who" style="color:var(--amber)"></div></div></div>
+      <div class="k" style="margin-top:9px;color:var(--ink-2)">Spawns, 14 days: <span id="sp-total"></span></div>
+      <div id="sp-bars"></div>
+    </div>
+  </div></section>
+
+  <!-- small machine tiles -->
+  <section class="tile sm" id="U">
+    <div class="row"><span class="t"><b>CPU</b></span><span class="k"><span id="cpu-ncores"></span> cores</span></div>
+    <div class="row" style="margin-top:10px;align-items:flex-end"><div class="h h4"><span class="fx hx" id="cpu-pct"></span><small>%</small></div><div id="cpu-cores" style="display:flex;gap:4px"></div></div>
+    <div class="k cells" style="margin-top:5px"><span>busiest <span id="cpu-busy"></span></span><span>load <span id="cpu-load"></span></span><span>GPU <span id="cpu-gpu"></span></span></div>
+  </section>
+  <section class="tile sm" id="V">
+    <div class="row"><span class="t"><b>Memory</b></span><span class="pill" id="mem-pill"></span></div>
+    <div class="row" style="margin-top:8px;align-items:flex-end"><div class="h h4"><span class="fx hx w4" id="mem-used"></span><small>GB</small></div>
+      <div class="k" style="text-align:right">of <span id="mem-total"></span> GB<br>swap <span class="fx" id="mem-swap" style="min-width:1.5em"></span> GB</div></div>
+    <!-- three segments laid end to end by transform (README 8a), never by width -->
+    <div id="mem-bar" style="position:relative;height:6px;border-radius:3px;overflow:hidden;margin-top:7px;background:var(--track)">
+      <i class="tw" style="background:var(--mem-w)"></i><i class="tw" style="background:var(--cyan)"></i><i class="tw" style="background:var(--mem-c)"></i></div>
+    <div class="k cells eq" style="margin-top:4px"><span>wired <span id="mem-w"></span></span><span>active <span id="mem-a"></span></span><span>compr. <span id="mem-c"></span></span></div>
+  </section>
+  <section class="tile sm" id="W">
+    <div class="row"><span class="t"><b>Network</b></span><span class="k">down, last <span class="fx" id="net-secs" style="min-width:1.2em"></span> s</span></div>
+    <div class="row" style="margin-top:10px;align-items:flex-end"><div class="h h4"><span class="fx hx w3" id="net-rx"></span><small id="net-rx-u" style="display:inline-block;min-width:1.55em"></small></div>
+      <div class="spk" style="width:84px;height:34px"><svg id="net-svg" width="84" height="34" viewBox="0 0 84 34"></svg></div></div>
+    <div class="k cells two" style="margin-top:4px"><span>up <span id="net-up"></span></span><span>peak <span id="net-peak"></span></span></div>
+  </section>
+  <section class="tile" id="H">
+    <div class="row"><span class="t"><b>Contributions</b>, last 12 months</span><span class="t"><span class="priv-login" id="gh-login"></span>, <span id="gh-range"></span></span></div>
+    <div class="row" style="align-items:flex-end;margin-top:8px">
+      <div class="heroline" style="gap:12px"><div class="h h3" id="gh-total"></div>
+        <div class="sub" style="padding-bottom:4px">on <span id="gh-active"></span> of <span id="gh-ndays"></span> days,<br>best <b id="gh-best"></b> on <span id="gh-best-d"></span>, circled</div></div>
+      <div class="k" id="gh-legend" style="display:flex;gap:11px;padding-bottom:4px"></div>
+    </div>
+    <svg id="gh-svg" width="674" height="117" style="margin-top:10px"></svg>
+  </section>
+  <section class="tile" id="I">
+    <div class="t"><b>GitHub today</b></div>
+    <div class="heroline" style="gap:10px;margin-top:8px"><div class="h h4" id="gt-today" style="color:var(--gh4)"></div>
+      <div class="sub" style="padding-bottom:2px">contributions,<br>boxed in the grid</div></div>
+    <div class="facts" style="grid-template-columns:1fr 1fr;margin-top:10px;gap:10px">
+      <div class="fact"><span class="k">This week</span><div class="n" id="gt-week"></div></div>
+      <div class="fact"><span class="k">Streak</span><div class="n"><span id="gt-streak"></span><small id="gt-streak-u"></small></div></div>
+    </div>
+    <!-- the newest public events, newest first; each age closes its own line -->
+    <div class="slots" id="gt-list" style="border-top:1px solid var(--hair);margin-top:12px;height:84px"></div>
+  </section>
+  <section class="tile" id="P">
+    <div class="row"><span class="t"><b>14 days</b> of output</span></div>
+    <div class="heroline" style="gap:8px;margin:8px 0 10px"><div class="h h4"><span id="fn-total"></span><small id="fn-total-u"></small></div>
+      <div class="k" style="padding-bottom:3px"><span id="fn-range"></span><br><span id="fn-avg"></span></div></div>
+    <svg id="fn-svg" width="194" height="136" viewBox="0 0 194 136"></svg>
+  </section>
+  <section class="tile sm" id="Y">
+    <div class="row"><span class="t"><b>Disk</b></span><span class="k">of <span id="dk-total"></span> GB</span></div>
+    <div class="row" style="margin-top:10px;align-items:flex-end;justify-content:flex-start;gap:7px"><div class="h h4"><span class="fx hx w3" id="dk-free"></span><small>GB</small></div>
+      <span class="sub" style="padding-bottom:2px">free</span></div>
+    <div class="bar" style="margin-top:8px"><i class="fill-cyan" id="dk-bar" style="transform:scaleX(0)"></i></div>
+    <div class="k cells two" style="margin-top:5px"><span>read <span id="dk-rd"></span></span><span>write <span id="dk-wr"></span></span></div>
+  </section>
+  <section class="tile sm" id="Z">
+    <div class="row"><span class="t"><b>Battery</b></span><span class="k" id="bt-state"></span></div>
+    <div class="row" style="margin-top:10px;align-items:flex-end"><div class="h h4" id="bt-pct-box"><span class="fx hx w2" id="bt-pct"></span><small>%</small></div>
+      <svg width="86" height="34" viewBox="0 0 86 34"><rect x="0.5" y="0.5" width="78" height="33" rx="8" fill="none" style="stroke:var(--ref)"/>
+        <rect x="81" y="11" width="4" height="12" rx="2" style="fill:var(--ref)"/><rect id="bt-fill" class="tw" x="4" y="4" width="71" height="26" rx="5" style="transform-origin:4px 0;transform:scaleX(0)"/></svg></div>
+    <div class="k" id="bt-left" style="margin-top:6px"></div>
+  </section>
+
+  <!-- machine preset only -->
+  <section class="tile" id="G">
+    <div class="row"><span class="t"><b>GPU</b></span><span class="k">renderer <span id="gpu-ren"></span>, tiler <span id="gpu-til"></span></span></div>
+    <div class="row" style="margin-top:10px;align-items:flex-end"><div class="h h3"><span id="gpu-pct"></span><small>%</small></div></div>
+    <div class="spk" style="width:194px;height:52px;margin-top:12px"><svg id="gpu-svg" width="194" height="52" viewBox="0 0 194 52"></svg></div>
+    <div class="row" style="margin-top:4px"><span class="k">last 60 s</span><span class="k">peak <span id="gpu-peak"></span></span></div>
+    <div class="bar" style="margin-top:10px"><i class="fill-cyan" id="gpu-vbar" style="transform:scaleX(0)"></i></div>
+    <div class="k" style="margin-top:5px">VRAM <span id="gpu-vram"></span> of <span id="gpu-valloc"></span></div>
+  </section>
+  <section class="tile" id="T">
+    <div class="t"><b>Top processes</b></div>
+    <div class="k" style="margin-top:10px;color:var(--ink-2)">CPU, % of one core</div>
+    <div id="top-cpu"></div>
+    <div class="k" style="margin-top:12px;color:var(--ink-2)">Memory</div>
+    <div id="top-mem"></div>
+  </section>
+</main>
+
+<script src="charts.js"></script>
+<script src="weather.js"></script>
+<script src="bento.js"></script>
+</body>
+</html>

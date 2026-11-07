@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>The Ledger</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+@font-face{font-family:"Newsreader";src:url(fonts/Newsreader-opsz-wght.woff2) format("woff2");font-weight:200 800}
+@font-face{font-family:"Newsreader";src:url(fonts/Newsreader-Italic-opsz-wght.woff2) format("woff2");font-weight:200 800;font-style:italic}
+@font-face{font-family:"Schibsted Grotesk";src:url(fonts/SchibstedGrotesk-wght.woff2) format("woff2");font-weight:400 900}
+@font-face{font-family:"Schibsted Grotesk";src:url(fonts/SchibstedGrotesk-Italic-wght.woff2) format("woff2");font-weight:400 900;font-style:italic}
+
+/* A financial-press page, reset every period. Newsreader carries the voice
+   (headlines, decks, big figures); Schibsted Grotesk, a newsroom grotesque, sets
+   every table, label and the close.
+   Two printings of the same page, measured with palmath.py (APCA Lc, WCAG):
+   Day stock #F0DFD0: ink 85 (12.0:1), ink2 75, claret 72, teal 70; idle dot 3.5:1.
+   Night stock #12100E, a black paper printed in metallic and coloured inks: white
+   (ink) 96, silver (ink2, every rule) 65, gold 66 (its sheen runs 83 to 61),
+   vermilion (claret) 61, verdigris (teal) 63; on the #1D1915 tint white 95, silver 64,
+   gold 65. The role tokens keep their day names: --claret is the alert ink and --teal
+   the live one in both printings. --rule colours every rule (day: the ink; night:
+   silver); --accent is the lead's kicker (day: claret; night: gold); --gold with its
+   two sheen stops is the display ink (day: all three are the ink, so nothing changes).
+   ledger.js carries the same values (INKS) for the slow cross-fade at sunrise and
+   sunset; change them in both places.
+   The load inks (--load0 to --load4: calm, working, busy, heavy, over) run the live ink
+   to the alert ink through printer's greens and an ochre: calm is a viridian by day and
+   the verdigris the strips were always drawn in by night; over is --claret, so red is only
+   ever "over". Lightness steps with load (day darker, night
+   brighter, then the alert ink). Day Lc 60 to 72 (L* 44 to 31); night Lc 63 to 83
+   (L* 75 to 87, then the vermilion at 73). Under deuteranopia neighbours stay 4.6 dE00
+   apart or more by day and 6.4 by night, heavy to over 12 and 9; over also carries a
+   rule under its figure and the strips a dotted 90% line. notes.md, "Load inks". */
+:root{
+  --paper:#F0DFD0; --tint:#E7D1BF; --ink:#1C2430; --ink2:#4A4440; --claret:#8A1F3D; --teal:#0B5A63;
+  --hair:rgba(28,36,48,.22); --grain:rgba(28,36,48,.035); --lamp:#F3D6A6;
+  --idle:#86735F; --bgstate:#7C6A5C;
+  --rule:#1C2430; --accent:#8A1F3D; --gold:#1C2430; --gold-hi:#1C2430; --gold-lo:#1C2430; --press:#6E1530;
+  --load0:#2A7462; --load1:#3A7030; --load2:#636612; --load3:#784608; --load4:#8A1F3D;
+  font-size:calc(100vw / 94.5);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme=day]){
+    --paper:#12100E; --tint:#1D1915; --ink:#F2EDE4; --ink2:#BCBAB4; --claret:#F99B70; --teal:#7CC6A6;
+    --hair:rgba(188,186,180,.24); --grain:rgba(242,237,228,.035); --idle:#858280; --bgstate:#9A9792;
+    --rule:#BCBAB4; --accent:#DBB762; --gold:#DBB762; --gold-hi:#F1D78A; --gold-lo:#D4AE5A; --press:#FFB894;
+    --load0:#7CC6A6; --load1:#9DD08A; --load2:#C3D673; --load3:#E8D9A0; --load4:#F99B70;
+  }
+}
+:root[data-theme=night]{
+  --paper:#12100E; --tint:#1D1915; --ink:#F2EDE4; --ink2:#BCBAB4; --claret:#F99B70; --teal:#7CC6A6;
+  --hair:rgba(188,186,180,.24); --grain:rgba(242,237,228,.035); --idle:#858280; --bgstate:#9A9792;
+  --rule:#BCBAB4; --accent:#DBB762; --gold:#DBB762; --gold-hi:#F1D78A; --gold-lo:#D4AE5A; --press:#FFB894;
+  --load0:#7CC6A6; --load1:#9DD08A; --load2:#C3D673; --load3:#E8D9A0; --load4:#F99B70;
+}
+
+*{box-sizing:border-box;margin:0}
+html,body{height:100%;overflow:hidden;background:var(--paper);color:var(--ink)}
+/* Every figure on the page is tabular, so a changing value never changes its width.
+   Schibsted's own tnum also widened . , : ; # % to a figure ("62 ,502"); the files in
+   fonts/ are patched so it covers the ten digits only (fonts/OFL.txt). */
+body{font-family:"Schibsted Grotesk",sans-serif;font-variant-numeric:lining-nums tabular-nums;-webkit-font-smoothing:antialiased;
+  background-image:radial-gradient(var(--grain) .6px,transparent .7px);background-size:3px 3px}
+svg{display:block;max-width:100%;overflow:visible}
+#limitChart,#spawnBar,#flow,#days,#matrix,#mix,#memBar,#cores{width:100%}
+text{font-family:"Schibsted Grotesk",sans-serif;font-variant-numeric:lining-nums tabular-nums}
+/* Moving parts of a chart are sprites: small SVGs over it, each on a layer of its own,
+   moved by one transform per line with a transition as long as the runtime's tween
+   (--kiln-tween). The compositor runs the motion; nothing repaints. */
+.chart{position:relative}
+.chart .spr{position:absolute;max-width:none;pointer-events:none;will-change:transform;
+  transition:transform var(--kiln-tween) cubic-bezier(.33,1,.68,1)}
+/* the output chart: its data slides in a window that clips it; the notes sit over both */
+.chart .win{position:absolute;overflow:hidden}
+.chart .slide{max-width:none;will-change:transform}
+.chart .over{position:absolute;left:0;top:0;max-width:none;pointer-events:none}
+
+/* The left 80 px is the binding margin: his Dock sits there (x < 66, y 225-757),
+   so the page starts at 5rem and only paper runs under it. The masthead starts
+   below the notch (x 663-848, y < 32). */
+.page{position:fixed;inset:2.55rem 1.75rem 0 5rem;display:grid;grid-template-columns:repeat(12,minmax(0,1fr));column-gap:1.25rem;
+  grid-template-rows:auto auto auto auto auto 1fr;align-content:start}
+
+/* masthead: four parts across the full measure, the nameplate, the dateline, the ear and
+   the clock, with one even gutter between them and every part standing on one baseline,
+   as a broadsheet's nameplate and ears do. The ear takes the width that is left, so the
+   paper between the parts is only the gutter, halved by a hairline as the close's
+   columns are. Fixed slots: the dateline is as wide as its longest date ("Wednesday 30
+   September 2026") and the clock as wide as "00:00", so nothing moves when they change.
+   The nameplate's line is short (.82) and its descender hangs into the foot, so the
+   masthead is no taller than it was with a 2.1rem nameplate. */
+.mast{grid-column:1/-1;display:grid;grid-template-columns:auto 0 11.4rem 0 minmax(0,1fr) 0 auto;column-gap:1.25rem;align-items:end;align-items:last baseline;padding:.03rem 0 .3rem;border-bottom:2px solid var(--rule)}
+.mast .cr{align-self:stretch;border-left:1px solid var(--hair)}
+.mast .name{font-family:"Newsreader",serif;font-weight:700;font-size:3.5rem;letter-spacing:-.012em;line-height:.82;font-variation-settings:"opsz" 72}
+.mast .edition{font-size:.76rem;color:var(--ink2);line-height:1.2;white-space:nowrap}
+.mast .period{margin-left:-.3rem}
+.mast .clock{justify-self:end;display:flex;align-items:baseline;gap:.45rem}
+.mast .clock .t{font-family:"Newsreader",serif;font-size:2.9rem;font-weight:500;line-height:.9;font-variation-settings:"opsz" 72;width:2.8em;text-align:right}
+.mast .clock .ap{font-size:.95rem;color:var(--ink2)}
+.sub{grid-column:1/-1;height:3px;border-bottom:1px solid var(--rule);margin-bottom:.5rem}
+/* The period readout (btop's corner): a dot that beats softly about once a second
+   while lines arrive (Kiln.onBeat) and goes dim when they stop, and the period itself,
+   lit claret for 1.5 s when he changes it */
+.period{display:inline-flex;align-items:center;gap:.3rem;padding:0 .3rem;border-radius:2px}
+/* At rest .65 (day 3.0:1, Lc 49; night 4.6:1, Lc 33), beating to 1. Stopped, it is a
+   hollow ring in ink2 at .85 (day 5.1:1, Lc 66; night 7.3:1, Lc 50): plainly off, and
+   the shape says it as well as the colour. */
+.period .pulse{width:.38rem;height:.38rem;border-radius:50%;background:var(--teal);opacity:.65;transition:opacity .6s,background-color .6s,box-shadow .6s}
+html.kiln-stale .period .pulse{opacity:.85;background:transparent;box-shadow:inset 0 0 0 1.25px var(--ink2)}
+.period b{font-weight:600;color:var(--ink)}
+.period.lit,.period.lit b{color:var(--paper)}
+
+.sec{border-top:1px solid var(--rule);padding-top:.35rem}
+.h3{font-size:.8rem;font-weight:700;letter-spacing:.01em;display:flex;justify-content:space-between;align-items:baseline;margin-bottom:.3rem;white-space:nowrap}
+.h3 span{font-weight:400;color:var(--ink2)}
+/* the right-hand note fills the rest of the rule, right-aligned: its box never moves */
+.h3 > span:last-child{flex:1 1 0;min-width:0;padding-left:.75rem;text-align:right;overflow:hidden;text-overflow:ellipsis}
+.hed,.deck{font-family:"Newsreader",serif}
+/* headlines break into even lines, decks never leave a word alone on the last; both
+   hold while a figure changes in place, since a tabular figure keeps its width */
+.hed{font-weight:600;line-height:1.04;letter-spacing:-.012em;font-variation-settings:"opsz" 72;text-wrap:balance}
+.deck{font-size:1.02rem;line-height:1.4;color:var(--ink2);font-variation-settings:"opsz" 16;text-wrap:pretty}
+.deck b{font-weight:600;color:var(--ink)}
+
+/* A headline box holds a fixed number of lines, so a new sentence never moves the
+   page. A new line is revealed left to right, like a line being set, while the old
+   one lifts away. */
+.hl{position:relative;height:calc(var(--lines) * 1.04em);overflow:visible}
+.deck.hl{height:calc(var(--lines) * 1.4em)}
+.hl .ln{position:absolute;left:0;top:0;right:0}
+
+.fig{font-family:"Newsreader",serif;font-weight:500;line-height:1;font-variation-settings:"opsz" 72}
+/* The gold ink: the nameplate, the clock, the allowance and the temperature. By night a
+   static sheen runs through the glyphs, light at the head and deeper at the foot, as a
+   metallic ink catches the light; it is a gradient clipped to the type, never a glow. By
+   day every stop is the ink, so the rule below is never applied and nothing changes.
+   The sheen is a background, and WebKit paints a background only inside the box: glyph
+   ink above the box is left transparent. Newsreader's ascent is .735em and its figures
+   and capitals stand up to .76em, so the clock's .9 line (box top .685em over the
+   baseline) cut 1.6 to 2.3 px off the tops of 8, 4, 0 and 7 in the host (2026-11-05,
+   "8:40"; Chromium paints past the box and never showed it). The padding grows the box
+   by .15em each way, past every glyph; the margin gives it back, so nothing moves. */
+.mast .name,.mast .clock .t,.fig.gold{color:var(--gold);padding-block:.15em;margin-block:-.15em}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme=day]) :is(.mast .name,.mast .clock .t,.fig.gold){background:linear-gradient(166deg,var(--gold-hi),var(--gold) 48%,var(--gold-lo));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+}
+:root[data-theme=night] :is(.mast .name,.mast .clock .t,.fig.gold){background:linear-gradient(166deg,var(--gold-hi),var(--gold) 48%,var(--gold-lo));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.lbl{font-size:.72rem;color:var(--ink2);margin-top:.2rem;line-height:1.3;white-space:nowrap}
+.claret{color:var(--claret)}
+.kv{display:flex;justify-content:space-between;font-size:.8rem;padding:.2rem 0;border-bottom:1px solid var(--hair)}
+.kv span:first-child{color:var(--ink2)}
+.kv span:last-child{flex:1 1 0;text-align:right}
+.foot5{font-size:.7rem;color:var(--ink2);margin-top:.35rem;font-style:italic;white-space:nowrap}
+
+/* The ear: what needs him. Calm, it is set like the dateline, type on the paper between
+   the hairlines: the head in silver italic on the masthead's baseline, and the notes in
+   three rows of the dateline's own size and leading, so each row stands on a dateline
+   row's baseline. Waiting or failed, the ear goes to press: a block of the alert ink is
+   laid behind the head (reversed type, a "Stop press" slug, and a glyph that says which:
+   the printer's fist for an ask, the dagger for a failure), and the notes print in the
+   alert ink. The block bleeds into the gutters round the head's slot, so no word moves.
+   While it stands, a lighter (night) or deeper (day) pull of the same ink breathes over
+   it: one opacity animation on one small layer. It moves the ink only away from the type,
+   so the reversed type is never less legible than at rest (Lc 62 night, 75 day). Its
+   tempo (--breath, a half breath) quickens as the wait passes his median answer. It runs
+   only under .on; the runtime pauses its loops when the wallpaper is covered but not CSS,
+   so html.kiln-paused holds it, and reduced motion never runs it. */
+.ear{position:relative;display:grid;grid-template-columns:12.4rem minmax(0,1fr);column-gap:1.25rem;align-items:end;align-items:last baseline}
+.ear .hed{font-size:1.5rem;font-style:italic;font-weight:500;color:var(--ink2);z-index:1}
+/* an in-flow strut on the head's own line: the set line is absolute, and this gives the
+   box the baseline the line stands on, so the head joins the masthead's baseline */
+.ear .hed::before{content:"\200b"}
+.ear .hed .ln{white-space:nowrap}
+.ear .nt p{font-size:.76rem;line-height:1.2;color:var(--ink2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ear .press{position:absolute;left:-.6rem;width:13.6rem;top:-.12rem;bottom:-.58rem;background:var(--claret);opacity:0;overflow:hidden}
+.ear .press i{position:absolute;inset:0;background:var(--press);opacity:0}
+.ear .kick{position:absolute;left:0;top:0;font-size:.76rem;line-height:1.2;z-index:1;color:var(--paper);opacity:0}
+.ear .kick span{font-size:.62rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;font-feature-settings:"case"}
+.ear .fist{display:inline-block;height:.6em;width:auto;margin:0 .3em 0 .02em;fill:currentColor;overflow:visible}
+.ear.on .press,.ear.on .kick{opacity:1}
+.ear.on .hed{font-style:normal;font-weight:700;color:var(--paper)}
+.ear.on .nt .a{color:var(--claret);font-weight:600}
+.ear.on .nt .b{color:var(--claret)}
+.ear.on .press i{will-change:opacity;animation:breathe var(--breath,2.4s) ease-in-out infinite alternate}
+html.kiln-paused .ear .press i{animation-play-state:paused}
+@keyframes breathe{to{opacity:1}}
+
+/* keyed tables: each row is absolutely placed in a box of fixed slots, so rows
+   enter, leave and reorder without moving anything below the table */
+.tbl{font-size:.8rem}
+.tbl .th,.tbl .row{display:grid;grid-template-columns:var(--cols);align-items:center}
+.tbl .th{border-bottom:1px solid var(--rule);font-size:.7rem;font-weight:600;color:var(--ink2);padding:.1rem 0 .2rem}
+.tbl .tb{position:relative;height:calc(var(--slots) * 1.4rem)}
+.tbl .row{position:absolute;left:0;right:0;top:0;height:1.4rem;border-bottom:1px solid var(--hair)}
+/* The agents' ages tick every second. On a layer of their own, those changes are not
+   counted with the page's: over five changed boxes in one layer, WebKit repaints the
+   box around all of them, from the desk down to the close (pass 3). */
+#agT .tb{will-change:transform}
+.tbl .th > *,.tbl .row > *{text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-left:.45rem;position:relative}
+.tbl .th > .l,.tbl .row > .l{text-align:left}
+.tbl .th > :first-child,.tbl .row > :first-child{padding-left:0}
+.tbl .dim{color:var(--ink2)}
+/* a background (daemon-hosted) session: a small-caps mark before its name, fixed per row */
+.tbl .row .bgk{font-size:.62rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;font-feature-settings:"case";color:var(--ink2);margin-right:.35rem;padding:0;overflow:visible}
+/* a figure fills its cell, so its box is the column's; context is two slots, tokens and share */
+.tbl .row .v{display:block}
+.tbl .row .ctx{display:flex;justify-content:flex-end}
+.tbl .row .ctx .v{width:2.2rem;flex:none}
+.tbl .row .ctx .pc{width:2rem;flex:none}
+.tbl .row.flag{color:var(--claret)} .tbl .row.flag .dim{color:var(--claret)}
+.tbl .empty{position:absolute;left:0;top:0;height:1.4rem;line-height:1.4rem;font-family:"Newsreader",serif;font-style:italic;color:var(--ink2);font-size:.86rem}
+.dot{display:inline-block;width:.5rem;height:.5rem;border-radius:50%;margin-right:.35rem;vertical-align:.05rem;transition:background-color .4s}
+/* "price moved": a changed cell gets a short claret rule that fades over 2 s */
+.tk{position:absolute;left:.45rem;right:0;bottom:2px;height:1.5px;background:var(--claret);opacity:0;pointer-events:none}
+
+/* a core's number and figure under its strip (sized in px, as the SVG beside it is).
+   Each strip is a ruled column, as the close is: the rule at its left says which
+   number a figure belongs to, where spacing alone paired "42" with the next core */
+.chart .cfs{position:absolute;left:0;right:0;top:38px;height:14px;will-change:transform;pointer-events:none}
+.chart .cf{position:absolute;top:0;height:14px;display:grid;grid-template-columns:auto minmax(0,1fr);column-gap:3px;font-size:11px;line-height:14px;color:var(--ink2)}
+.chart .cf span{font-size:10px}
+.chart .cf b{font-weight:600;color:var(--ink);text-align:right}
+/* the figure in its load ink (ledger.js sets the class when the band changes, at most once
+   a second; no transition). Over is ruled under as well, so it never rests on hue alone */
+.chart .cf b.l0{color:var(--load0)} .chart .cf b.l1{color:var(--load1)} .chart .cf b.l2{color:var(--load2)}
+.chart .cf b.l3{color:var(--load3)} .chart .cf b.l4{color:var(--load4);text-decoration:underline 1.5px;text-underline-offset:2px}
+
+/* GitHub's latest, after the one the headline reports: a fixed box of three lines */
+.wire{position:relative;height:3.15rem;margin-top:.3rem;border-top:1px solid var(--hair);font-size:.72rem}
+.wire > div{display:grid;grid-template-columns:8.6rem minmax(0,1fr);height:1.05rem;line-height:1.05rem;white-space:nowrap}
+.wire span{overflow:hidden;text-overflow:ellipsis}
+.wire span:first-child{color:var(--ink2)}
+
+/* the weather plate: an engraving on a canvas, rain and snow on their own layers */
+.vig{position:relative;height:11.5rem;overflow:hidden}
+.vig .plate{position:absolute;inset:0;overflow:hidden}
+.vig canvas{position:absolute;left:0;top:0}
+.vig canvas.fall{will-change:transform}
+
+/* The close: a board of quotes ruled into columns, as a ledger is. Each quote is its
+   label at the left rule and its figure right-aligned against the next, in a slot as
+   wide as its widest value (em of the board's face, from the font's advances), so a
+   quote changes in place and nothing beside it moves. A change carries a drawn
+   triangle at its slot's left edge: the font has no ▲, and the fallback face lifted
+   the line by a pixel. */
+.close{grid-column:1/-1;align-self:end;border-top:2px solid var(--rule);margin-top:.5rem;padding:.32rem 0 .45rem;
+  display:grid;grid-template-columns:7.9rem repeat(10,auto);align-items:baseline;white-space:nowrap;font-size:.78rem}
+.close > span{display:flex;align-items:baseline;padding:0 .4rem;border-left:1px solid var(--hair)}
+.close > span.lead{display:block;border:0;padding-left:0}
+.close > span:last-child{padding-right:0}
+/* The quote is the figure: the ticker symbol steps back to small tracked capitals in
+   ink2 (night Lc 65, day 75), with case-sensitive forms so the slash in OUT/MIN sits
+   on the capitals. Bold capitals in ink competed with the numbers they name. */
+.close b{font-size:.84em;font-weight:600;letter-spacing:.07em;color:var(--ink2);font-feature-settings:"case";margin-right:.45rem}
+.close .w{color:var(--ink2);margin-left:.25em}
+.close .v{display:inline-block;flex:none;text-align:right}
+.close b + .v{margin-left:auto}
+.close .d{position:relative;margin-left:.35rem}
+.close .d::before{content:"";position:absolute;left:0;top:.36em;border:.3em solid transparent;border-top:0;border-bottom:.52em solid}
+.close .d.dn::before{border-bottom:0;border-top:.52em solid;top:.38em}
+.close .d.dim::before{display:none}
+.close .d.dim{color:var(--ink2)}
+.close .up{color:var(--teal)} .close .dn{color:var(--claret)}
+.close .lead{font-family:"Newsreader",serif;font-style:italic;color:var(--ink2);font-size:.8rem}
+
+/* the presets (config.js: layout) */
+.page[data-layout=weekend] #machine{display:none}
+.page[data-layout=weekend] #secDays{grid-column:1/6!important}
+.page[data-layout=weekend] #secMatrix{grid-column:6/10!important}
+.page[data-layout=weekend] #secMix{grid-column:10/13!important}
+.page[data-layout=brief] > :not(.mast):not(.sub):not(#lead){display:none}
+/* brief: the lead owns the page, set larger and centred in the column below the mast */
+.page[data-layout=brief]{grid-template-rows:auto auto 1fr}
+.page[data-layout=brief] #lead{grid-column:1/9!important;align-self:center;zoom:1.4;margin-bottom:3rem}
+
+@media (prefers-reduced-motion: reduce){ *{animation:none!important;transition:none!important} }
+</style>
+</head>
+<body>
+<main class="page" id="page">
+  <header class="mast">
+    <div class="name">The Ledger</div><i class="cr"></i>
+    <div class="edition"><span id="dateLong">&nbsp;</span><br><span id="edName">&nbsp;</span><br>
+      <span class="period" id="period"><i class="pulse" id="pulse"></i><span>Updated every <b id="periodMs"></b> ms</span></span></div><i class="cr"></i>
+    <div class="ear" id="ear"><b class="press" id="earPress"><i></i></b><span class="kick"><span>Stop press</span></span><div class="hed hl" id="earHed" style="--lines:1"></div><div class="nt"><p class="a" id="earA">&nbsp;</p><p class="b" id="earB">&nbsp;</p><p id="earC">&nbsp;</p></div></div><i class="cr"></i>
+    <div class="clock"><span class="t" id="clk"></span><span class="ap" id="ap"></span></div>
+  </header>
+  <div class="sub"></div>
+
+  <!-- row A: the allowance, the desk, the weather -->
+  <article style="grid-column:1/6" id="lead">
+    <div style="font-size:.78rem;font-weight:700;color:var(--accent);margin-bottom:.3rem">Claude allowance</div>
+    <h1 class="hed hl" id="leadHed" style="font-size:2.85rem;--lines:2"></h1>
+    <p class="deck hl" id="leadDeck" style="margin-top:.4rem;max-width:34rem;--lines:2"></p>
+    <div style="display:grid;grid-template-columns:auto 1fr;column-gap:1.3rem;margin-top:.35rem;align-items:end">
+      <div><div class="fig gold" style="font-size:5rem;letter-spacing:-.04em;min-width:7.2rem"><span id="pct"></span><span style="font-size:2.2rem">%</span></div><div class="lbl">of the weekly limit used</div></div>
+      <svg id="limitChart"></svg>
+    </div>
+    <div style="display:grid;grid-template-columns:1.5fr 1fr 1fr;column-gap:1rem;margin-top:.5rem;border-top:1px solid var(--rule);padding-top:.35rem;white-space:nowrap">
+      <div><div class="fig" style="font-size:1.55rem" id="cdown"></div><div class="lbl" id="cdownL"></div></div>
+      <div><div class="fig" style="font-size:1.55rem" id="burn"></div><div class="lbl">burn per hour, recent</div></div>
+      <div><div class="fig" style="font-size:1.55rem" id="elapsed"></div><div class="lbl">into the week</div></div>
+    </div>
+    <p class="foot5" id="five">&nbsp;</p>
+  </article>
+
+  <section style="grid-column:6/10" id="desk">
+    <div class="sec"><div class="h3">Sessions <span id="ctxWin"></span></div>
+      <h2 class="hed hl" id="deskHed" style="font-size:1.5rem;margin:.1rem 0 .4rem;--lines:2"></h2>
+      <div class="tbl" id="sessT" style="--slots:4;--cols:minmax(0,1fr) 4.2rem 4.7rem 3.2rem 2.8rem 2.9rem">
+        <div class="th"><span class="l" style="padding-left:.85rem">Session</span><span>State</span><span>Context</span><span>Out/min</span><span>15 min</span><span>Agents</span></div>
+        <div class="tb"></div></div></div>
+    <div class="sec" style="margin-top:.6rem"><div class="h3">Agents in the field <span id="agN"></span></div>
+      <div class="tbl" id="agT" style="--slots:3;--cols:7rem minmax(0,1fr) 6.4rem 4.6rem">
+        <div class="th"><span class="l">Agent</span><span class="l" style="padding-left:.8rem">Task</span><span>Session</span><span>Age</span></div>
+        <div class="tb"></div></div>
+      <div class="h3" style="margin-top:.55rem"><span style="color:var(--ink);font-weight:700">Spawned today</span><span id="spawnN"></span></div>
+      <svg id="spawnBar"></svg>
+      <p class="lbl claret" id="gpLine">&nbsp;</p></div>
+  </section>
+
+  <aside style="grid-column:10/13" id="weather">
+    <div class="sec"><div class="h3"><span style="color:var(--ink);font-weight:700" id="wxPlace">Weather</span><span id="wxObs"></span></div>
+      <div class="vig" id="vig"></div>
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;margin-top:.4rem">
+        <div><div class="fig gold" style="font-size:3.4rem"><span id="tempF"></span>°</div><div class="lbl" id="tempC">&nbsp;</div></div>
+        <div style="text-align:right;min-width:0"><div class="hed hl" id="cond" style="font-size:1.35rem;--lines:1;text-align:right"></div><div class="lbl" id="condSub">&nbsp;</div></div>
+      </div>
+      <div style="margin-top:.35rem">
+        <div class="kv"><span>Wind</span><span id="wind"></span></div>
+        <div class="kv"><span>Humidity, dew point</span><span id="hum"></span></div>
+        <div class="kv"><span>Sunrise, sunset</span><span id="sun"></span></div>
+        <div class="kv"><span id="nextEdL">Daylight</span><span id="nextEd"></span></div>
+      </div></div>
+  </aside>
+
+  <!-- row B: output, the Commits desk -->
+  <section class="sec" style="grid-column:1/6;margin-top:.55rem" id="output">
+    <div class="h3">Output <span>tokens per minute, last hour</span></div>
+    <h2 class="hed hl" id="outHed" style="font-size:1.5rem;margin:.1rem 0 .3rem;--lines:1"></h2>
+    <div class="chart"><svg id="flow"></svg></div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);column-gap:1rem;margin-top:.35rem;border-top:1px solid var(--rule);padding-top:.3rem">
+      <div><div class="fig" style="font-size:1.75rem" id="oToday"></div><div class="lbl">output today</div></div>
+      <div><div class="fig" style="font-size:1.75rem" id="oCache"></div><div class="lbl">cache reads today</div></div>
+      <div><div class="fig" style="font-size:1.75rem" id="oCalls"></div><div class="lbl">API calls today</div></div>
+      <div><div class="fig" style="font-size:1.75rem" id="oHit"></div><div class="lbl" id="oHit14">cache hit</div></div>
+    </div>
+  </section>
+  <section class="sec" style="grid-column:6/13;margin-top:.55rem" id="commits">
+    <div class="h3">The Commits desk <span id="ghWho"></span></div>
+    <h2 class="hed hl" id="ghHed" style="font-size:1.5rem;margin:.1rem 0 .3rem;--lines:1"></h2>
+    <div style="display:grid;grid-template-columns:minmax(0,1fr) 18.4rem;column-gap:1.4rem;align-items:start">
+      <div><svg id="cal"></svg>
+        <div class="lbl" style="display:flex;justify-content:space-between;margin-top:.1rem"><span id="calKey"></span><span class="claret" id="calRings"></span></div>
+        <p class="deck hl" id="ghDeck" style="font-size:.92rem;margin-top:.15rem;max-width:36rem;--lines:2"></p>
+        <div class="wire" id="wire"></div></div>
+      <div><div class="tbl" id="repoT" style="--slots:7;--cols:minmax(0,1fr) 3.9rem 3.3rem">
+          <div class="th"><span class="l">Repository, commits this year</span><span>Commits</span><span>Share</span></div>
+          <div class="tb"></div></div>
+        <p class="lbl" id="ghYear">&nbsp;</p></div>
+    </div>
+  </section>
+
+  <!-- row C: fourteen days and the machine -->
+  <section class="sec" style="grid-column:1/4;margin-top:.55rem" id="secDays"><div class="h3">Output by day <span id="d14"></span></div><div class="chart"><svg id="days"></svg></div></section>
+  <section class="sec" style="grid-column:4/7;margin-top:.55rem" id="secMatrix"><div class="h3">When the work happens <span id="mxPeak"></span></div><svg id="matrix"></svg></section>
+  <section class="sec" style="grid-column:7/9;margin-top:.55rem" id="secMix"><div class="h3">Agent mix, 14 days <span id="mixTot"></span></div><div class="chart"><svg id="mix"></svg></div></section>
+  <section class="sec" style="grid-column:9/13;margin-top:.55rem" id="machine">
+    <div class="h3">The machine <span id="macWho"></span></div>
+    <h2 class="hed hl" id="macHed" style="font-size:1.2rem;margin:.05rem 0 .35rem;--lines:1"></h2>
+    <div class="chart"><svg id="memBar"></svg></div>
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:.4rem"><div style="font-size:.72rem;font-weight:700;flex:1 1 0;white-space:nowrap" id="coreHd">Per core</div><div class="lbl" style="margin:0;flex:1 1 0;text-align:right" id="coreScale"></div></div>
+    <div class="chart"><svg id="cores"></svg></div>
+  </section>
+
+  <div class="close" id="close">
+    <span class="lead" id="cLead"></span>
+    <span><b>OUT/MIN</b><span class="v" id="cOut" style="width:3.5em"></span><span class="v d" id="cOutD" style="width:4.5em"></span></span>
+    <span><b>WEEK</b><span class="v" id="cWeek" style="width:2.8em"></span><span class="v d" id="cWeekD" style="width:2em"></span></span>
+    <span><b>CPU</b><span class="v" id="cCpu" style="width:3.1em"></span></span>
+    <span><b>GPU</b><span class="v" id="cGpu" style="width:2.8em"></span></span>
+    <span><b>MEM</b><span class="v" id="cMem" style="width:3.9em"></span></span>
+    <span><b>SWAP</b><span class="v" id="cSwap" style="width:3.9em"></span></span>
+    <span><b>NET</b><span class="v" id="cRx" style="width:5em"></span><span class="w">in</span><span class="v" id="cTx" style="width:5em"></span><span class="w">out</span></span>
+    <span><b>DISK</b><span class="v" id="cDisk" style="width:5.7em"></span></span>
+    <span><b>BATT</b><span class="v" id="cBatt" style="width:2.8em"></span><span id="cBattN" style="display:inline-block;width:6.6em"></span></span>
+    <span><b>LOAD</b><span class="v" id="cLoad" style="width:2.9em"></span></span>
+  </div>
+</main>
+
+<script src="config.js"></script>
+<script src="../_shared/kiln-runtime.js"></script>
+<script src="vignette.js"></script>
+<script src="ledger.js"></script>
+</body>
+</html>

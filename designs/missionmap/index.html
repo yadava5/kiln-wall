@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mission Map</title>
+<style>
+@font-face{font-family:"Fraunces";src:url(fonts/Fraunces-var.woff2) format("woff2");font-weight:100 900;font-style:normal}
+@font-face{font-family:"Hanken Grotesk";src:url(fonts/HankenGrotesk-var.woff2) format("woff2");font-weight:100 900;font-style:normal}
+@font-face{font-family:"Geist Mono";src:url(fonts/GeistMono-Variable.woff2) format("woff2");font-weight:100 900}
+
+/* One look, Foundry v4: smoked graphite panels over Oxford's lit contours. Every ink has one
+   meaning (notes.md has the table and the measurements):
+     --now   the present: live dot, now cursors, the hour under way, tokens landing
+     --al    needs you (waiting, failed)
+     --k1..3 session slots 1-3 (verdigris, steel, rose); --k0 a session without a slot
+     --m1..4 models Opus, Fable, Sonnet, Haiku (chalk, brass, pewter, iron)
+     --t0..4 tokens per hour, oxide -> straw     --g0..4 GitHub's year, iron -> chalk
+     --z1..4 the machine, chalk -> zinc          --idle stems and empty tracks
+   Words are --ink or --sec and never carry a colour of their own. */
+:root{
+  --bg:#141311;--pn:rgba(30,28,25,.66);--well:rgba(16,15,13,.55);--ed:rgba(235,230,220,.11);--tr:#2e2c28;
+  --ink:#ebe6dc;--sec:#bab5ab;--idle:#6f6a62;
+  --now:#ff6a13;--al:#ffd23f;
+  --k0:#8a857c;--k1:#46a98c;--k2:#9cc0de;--k3:#f2a0ad;
+  --m1:#e6e0d4;--m2:#cfa24e;--m3:#8e959a;--m4:#5d6267;
+  --t0:#2e2c28;--t1:#4a2620;--t2:#86452c;--t3:#c4824a;--t4:#f1d48a;
+  --g0:#2e2c28;--g1:#3b4044;--g2:#666c70;--g3:#a2a39f;--g4:#e6e0d4;
+  --z1:#e6e0d4;--z2:#aeaaa2;--z3:#7a7770;--z4:#4f4d48;
+}
+
+*{box-sizing:border-box;margin:0}
+html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--ink)}
+body{font-family:"Hanken Grotesk",sans-serif;font-weight:450;font-size:13px;line-height:16px;
+  font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
+svg{display:block;overflow:visible}
+svg text{font-family:"Hanken Grotesk",sans-serif;font-variant-numeric:tabular-nums;fill:var(--sec);font-size:11px}
+canvas{display:block}
+@media (prefers-reduced-motion: reduce){ *{transition:none !important} }
+
+#stage{position:absolute;left:0;top:0;width:1512px;height:982px;overflow:hidden}
+.disp{font-family:"Fraunces",serif;font-weight:400;letter-spacing:-.01em;font-variation-settings:"opsz" var(--opsz,14),"SOFT" 0,"WONK" 0}
+.f72{font-size:72px;line-height:72px;--opsz:72}
+.f28{font-size:28px;line-height:32px;--opsz:28}
+.f26{font-size:26px;line-height:32px;--opsz:26}
+.f22{font-size:22px;line-height:28px;--opsz:22}
+.sec{color:var(--sec)}
+.mono{font-family:"Geist Mono",monospace;font-weight:420;font-size:12px;letter-spacing:-.01em}
+
+/* Panels: smoked graphite. The ground reads through the frame; a darker well (::before,
+   inset 6, from under the title down) sits behind the rows and charts so the contours
+   recede to a ghost where data is. Padding 11 + the 1-pt edge puts content on the grid.
+   A row is one line-height tall; its label hangs from the left and its figure sits in a
+   fixed-width box on the right, so a changing figure never pushes anything (rule 13). */
+.card{position:absolute;background:var(--pn);border:1px solid var(--ed);border-radius:4px;padding:11px}
+.card::before{content:"";position:absolute;left:5px;right:5px;top:var(--wt,5px);bottom:5px;background:var(--well);border-radius:2px;pointer-events:none}
+.card>*{position:relative}
+.card.alert{border:2px solid var(--al);padding:10px}
+.t{position:relative;height:16px;line-height:16px;font-size:12px;color:var(--sec);margin-bottom:4px;white-space:nowrap}
+.r{position:relative;height:16px;line-height:16px;white-space:nowrap}
+.h20{height:20px;line-height:20px}.h24{height:24px;line-height:24px}.h32{height:32px;line-height:32px}.h36{height:36px;line-height:36px}
+.k{position:absolute;left:0;top:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.v{position:absolute;right:0;top:0;width:7em;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.k.sec,.v.sec{color:var(--sec)}
+.nm{font-size:15px;font-weight:600}
+.dot{position:absolute;left:0;top:6px;width:8px;height:8px;border-radius:50%;background:var(--idle)}
+.st{left:14px}
+.bar{height:6px;background:var(--tr);border-radius:2px;margin:3px 0 7px;overflow:hidden}
+.bar>i{display:block;height:100%;background:var(--idle);border-radius:2px;transform-origin:0 50%;transform:scaleX(0)}
+/* block-driven marks glide over one period, from the second line on (the first lands) */
+html.mm-live .bar>i,html.mm-live .gauge>i,html.mm-live .cols i b,html.mm-live .hbar b{transition:transform var(--kiln-tween,200ms) ease-out}
+.r .disp{top:-2px}
+.vr{position:absolute;width:1px;background:var(--ed)}
+.sw{display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:5px;vertical-align:0}
+
+/* Clock, top left: R + C1. "Now", and how often now is re-read (the live dot and period). */
+#CK .time{height:72px;white-space:nowrap}
+#CK .time i{display:inline-block;font-style:normal;text-align:center;width:.68em}
+#CK .time i.one{width:.5em}
+#CK .time .ap{font-family:"Hanken Grotesk",sans-serif;font-size:18px;font-weight:500;color:var(--sec);letter-spacing:0;margin-left:8px}
+#CK .date{margin-top:10px;font-size:15px;font-weight:500}
+#LDd{position:absolute;left:auto;right:54px;top:6px;width:8px;height:8px;border-radius:50%;background:var(--now);opacity:.5;transition:opacity 300ms}
+html.kiln-stale #LDd{opacity:.15}
+#CK.hi #LDn{color:var(--al)}
+
+/* Rail tiles (x 12-66) under the Dock: battery and disk, aligned to the bottom band. */
+.rail{padding:8px 4px;text-align:center;display:none}
+.gauge{position:relative;width:14px;height:32px;margin:0 auto 6px;background:var(--tr);border-radius:2px;overflow:hidden}
+.gauge>i{position:absolute;left:0;right:0;bottom:0;height:100%;background:var(--z1);transform-origin:50% 100%;transform:scaleY(0)}
+.rail .n{font-size:13px;font-weight:600;height:16px}
+.rail .u{font-size:11px;color:var(--sec);height:14px;line-height:14px}
+
+/* The hub: the only circle. Its rim is ten core arcs; inside, only the open count. */
+#hub{border-radius:50%;padding:0}
+#hub::before{border-radius:50%}
+#hub svg{position:absolute;left:-1px;top:-1px}
+#hub .in{position:absolute;left:0;right:0;top:64px;text-align:center}
+#hub .hn{height:32px;line-height:32px;white-space:nowrap}
+#hub .hn i{display:inline-block;font-style:normal;text-align:center;width:.7305em}
+#hub .hn .hl{font-family:"Hanken Grotesk",sans-serif;font-size:14px;font-weight:500;letter-spacing:0;margin-left:5px}
+#hub .hs{height:18px;line-height:18px;font-size:12px;color:var(--sec);white-space:nowrap}
+
+/* Session slots: three fixed leaves. The slot's ink runs down the left edge where its
+   ribbon lands; an empty slot shows who was last there. */
+.leaf::after{content:"";position:absolute;left:-1px;top:14px;bottom:14px;width:3px;border-radius:0 2px 2px 0;background:var(--kk,var(--tr))}
+.leaf .h20{height:22px;line-height:22px}.leaf .h20 .dot{top:7px}
+.leaf .dot{background:var(--kk)}
+.leaf.idle .dot{background:none;box-shadow:inset 0 0 0 1.5px var(--kk)}
+.leaf.waiting .dot,.leaf.failed .dot{background:var(--al);box-shadow:none}
+.leaf .bar>i{background:var(--kk)}
+.leaf .on,.leaf.free .off{display:block}
+.leaf .off,.leaf.free .on{display:none}
+.leaf.waiting .r5 .k{color:var(--ink)}
+.leaf.free .nm{color:var(--sec)}
+.s1{--kk:var(--k1)}.s2{--kk:var(--k2)}.s3{--kk:var(--k3)}
+
+/* Charts built from boxes move only by transform. Marks that change every line snap;
+   marks that change on a block keep the one-period tween. */
+.cols{position:relative;height:128px}
+.cols i{position:absolute;bottom:0;overflow:hidden;border-radius:2px 2px 0 0}
+.cols i b{position:absolute;left:0;right:0;bottom:0;height:100%;transform-origin:50% 100%;transform:scaleY(0)}
+.cols i.now{overflow:visible;outline:1px solid var(--now);outline-offset:1px}
+.axis{position:relative;height:16px;font-size:11px;color:var(--sec)}
+.axis span{position:absolute;top:0}
+.rule{height:1px;background:var(--idle);opacity:.6}
+.stack{position:relative;height:112px}
+.stack i{position:absolute;bottom:0;width:12px;height:112px}
+.stack i b{position:absolute;left:0;right:0;bottom:0;height:100%;transform-origin:50% 100%;transform:scaleY(0)}
+.leg{position:relative;height:16px;font-size:11px;color:var(--sec);white-space:nowrap}
+.leg span{position:absolute;top:0}
+.hbar{position:absolute;left:114px;top:7px;width:76px;height:6px;border-radius:2px;overflow:hidden}
+.hbar b{position:absolute;left:0;top:0;bottom:0;width:100%;background:var(--z3);transform-origin:0 50%;transform:scaleX(0)}
+.hbar.main b{background:var(--z1)}
+.memstack{position:relative;height:14px;background:var(--tr);border-radius:2px;overflow:hidden;margin:4px 0 10px}
+.memstack b{position:absolute;left:0;top:0;bottom:0;width:100%;transform-origin:0 50%;transform:scaleX(0)}
+.cores{position:relative;height:72px}
+.cores i{position:absolute;bottom:0;width:20px;height:72px;background:var(--tr);border-radius:2px;overflow:hidden}
+.cores i b{position:absolute;left:0;right:0;bottom:0;height:100%;background:var(--z1);transform-origin:50% 100%;transform:scaleY(0)}
+/* 90 %: a core past this hairline is pegged and its bar turns red (mm.js coreInk) */
+.cores i::after{content:"";position:absolute;left:0;right:0;bottom:90%;height:1px;background:rgba(235,230,220,.22)}
+.pbar{position:absolute;left:150px;top:7px;width:100px;height:6px;border-radius:2px;overflow:hidden}
+.pbar b{position:absolute;left:0;top:0;bottom:0;width:100%;background:var(--z2);transform-origin:0 50%;transform:scaleX(0)}
+/* the Log: every row from an open session carries its ink as a stripe (--k0 past the three
+   slots); a closed session's rows are named and unmarked. A run of rows reads as one bar. */
+#LG{padding-top:9px;padding-bottom:9px}
+.lg::before{content:"";position:absolute;left:-6px;top:2px;bottom:2px;width:3px;border-radius:1px;background:var(--kk,transparent)}
+/* the crown's agent rows: a dot in the session's ink */
+.ag .dot{top:6px;background:var(--kk)}
+.ag .k{left:14px}
+
+/* Needs you: the alert corner. */
+#NY .head{font-size:18px;font-weight:600}
+#NY .head .k{left:16px;width:224px}
+#NY.alert .head .dot{background:var(--al)}
+#NY .k{width:240px}
+
+/* Weather: a survey window looking south from campus, painted (sky.js). Sky and land are
+   canvases fixed at the window's size; cloud and rain are bitmaps on the layers that move.
+   v5: the window runs down to the reading (96 + 4 + a 32 headline + three rows + 8 = 188),
+   and the well starts where the picture ends, so no empty band sits between them. */
+#WX{padding:0;--wt:96px}
+#WX .win{position:relative;width:262px;height:96px;overflow:hidden;border-radius:3px 3px 0 0;background:#08090b}
+#WX .win>*{position:absolute;left:0;top:0}
+#WX .win canvas{width:262px;height:96px}
+#WX .body{padding:4px 11px 8px}
+#WXcl{background-size:262px 96px;background-repeat:repeat-x}
+#WXpr{background-size:262px 192px;background-repeat:repeat-y}
+#WXfx{opacity:0}
+#WX .off{height:96px;line-height:96px;text-align:center;color:var(--sec);font-size:12px}
+
+/* Stems, threads and the ground live under the cards. */
+#stems,#ground{position:absolute;left:0;top:0;width:1512px;height:982px;pointer-events:none}
+#stems path{fill:none;stroke:var(--idle);stroke-width:1}
+#ground path{fill:none;stroke-linecap:round;stroke-linejoin:round}
+#threads{position:absolute;left:0;top:0;width:1512px;height:982px;pointer-events:none}
+#threads svg{position:absolute}
+.bead{position:absolute;left:0;top:0;border-radius:50%;background:var(--now);box-shadow:0 0 0 1.5px var(--bg)}
+/* the machine's spoke: two minutes of CPU as a ribbon, now at the CPU card (mm.js drawMachine) */
+#mach{position:absolute;left:744px;top:552px;width:24px;height:228px;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="stage">
+  <img id="ground" width="1512" height="982" alt="">
+  <svg id="stems" viewBox="0 0 1512 982"></svg>
+  <canvas id="mach" width="48" height="456"></canvas>
+  <div id="threads"></div>
+  <div id="cards"></div>
+</div>
+<script src="../_shared/kiln-runtime.js"></script>
+<script src="ground.js"></script>
+<script src="horizon.js"></script>
+<script src="sky.js"></script>
+<script src="mm.js"></script>
+</body>
+</html>
