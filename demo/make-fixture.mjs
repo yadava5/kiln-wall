@@ -323,6 +323,7 @@ for (let d = 13; d >= 0; d--) {
 const MODELS = [["claude-opus-5-5", 0.56], ["claude-sonnet-5-5", 0.24], ["claude-fable-5-1", 0.12], ["claude-haiku-5-5", 0.08]];
 const hourShape = (d, upto) => { const h = Array.from({ length: 24 }, (_, k) => (k >= 9 && k <= 23 && k <= upto ? (0.4 + hn(d, 300 + k)) * (k >= 13 && k <= 17 ? 1.5 : 1) : k < upto && k < 2 ? 0.15 * hn(d, 330 + k) : 0)); const s = h.reduce((a, b) => a + b, 0) || 1; return h.map((v) => v / s); };
 const TYPES = ["Explore", "general-purpose", "builder", "reviewer", "tester", "Plan", "researcher", "designer"];
+const DAY_DRAWS = [];
 function analyticsAt(t) {
   const today = tokensAt(t).today;
   const days = DAYS.map((D, k) => {
@@ -335,12 +336,18 @@ function analyticsAt(t) {
     MODELS.forEach(([m, sh], j) => { const v = j === MODELS.length - 1 ? rest : Math.round(out * sh * (0.8 + 0.4 * hn(k, 90 + j))); if (v > 0 && !(D.wk && m === "claude-fable-5-1")) by_model[m] = v; rest -= v; });
     if (rest > 0) by_model["claude-opus-5-5"] += rest;
     const spawns = Math.round(R(6, 38) * D.f);
-    return {
+    const day = {
       date: D.date, out, cache_read, cache_write: last ? today.cache_write : Math.round(out * R(2.6, 3.4)),
       input: last ? today.input : calls * 10, calls, by_model, prompts: Math.round(R(18, 64) * D.f) + 1, spawns,
       general_purpose: Math.round(spawns * R(0.08, 0.22)), fails: last ? 1 : hn(k, 99) > 0.86 ? 1 : 0,   // today's one is data-pipeline's fail event ask_waits: RI(0, 5),
       out_main: Math.round(out * 0.54), cache_read_main: Math.round(cache_read * 0.47), hours: shape.map((v) => Math.round(v * out)),
     };
+    // The draws above run on every rebuild (keeping the random stream, and so every other block, as it
+    // was), but a day's drawn figures are the first build's: a rebuild every 10 s must not rewrite history.
+    const first = (DAY_DRAWS[k] ||= { cache_read: day.cache_read, cache_write: day.cache_write, prompts: day.prompts, spawns: day.spawns, general_purpose: day.general_purpose });
+    for (const key of last ? ["prompts", "spawns", "general_purpose"] : Object.keys(first)) day[key] = first[key];
+    day.cache_read_main = Math.round(day.cache_read * 0.47);
+    return day;
   });
   const rows = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
   const hm = rows.map(() => new Array(24).fill(0));
