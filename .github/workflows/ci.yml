@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Nothing personal may ship: home paths, e-mail, real session names, a real feed capture.
+  scrub:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: scrub gate
+        run: bash scripts/scrub-check.sh
+      # Negative control: a gate nobody has watched fail is not a gate.
+      - name: scrub gate rejects a planted home path
+        run: |
+          printf 'const p = "/%s/someone/.config";\n' Users > scrub-plant.js
+          if bash scripts/scrub-check.sh; then
+            echo "::error::scrub-check passed a file holding a home-directory path"
+            exit 1
+          fi
+          rm scrub-plant.js
+          echo "ok: rejected as expected"
+
+  # The app itself: Swift, AppKit and WebKit, built the way build.sh builds it.
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: build KilnWall.app
+        run: ./build.sh
+      - name: the bundle has an executable
+        run: test -x build/KilnWall.app/Contents/MacOS/KilnWall
+
+  # Every look replays the synthetic fixture in headless Chromium with zero page or console errors.
+  designs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: install chrome-headless-shell
+        run: npx playwright-core install --with-deps chromium-headless-shell
+      - name: the fixture is the generator's output
+        run: |
+          npm run fixture
+          git diff --exit-code -- designs/_shared/fixture.js
+      - name: every look, zero errors
+        run: npm run errcount
+      # Negative control: errcount must fail on a design that throws.
+      - name: errcount rejects a broken design
+        run: |
+          mkdir -p designs/zz-broken
+          printf '<!doctype html><script src="../_shared/kiln-runtime.js"></script><script>throw new Error("planted")</script>\n' > designs/zz-broken/index.html
+          if node designs/_shared/dev/errcount.mjs designs/zz-broken designs/_shared/fixture.js; then
+            echo "::error::errcount passed a design that throws"
+            exit 1
+          fi
+          echo "ok: rejected as expected"
