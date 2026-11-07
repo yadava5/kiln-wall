@@ -1,0 +1,17 @@
+{
+  "name": "kiln-wall",
+  "private": true,
+  "type": "module",
+  "description": "A live HTML dashboard as the macOS desktop wallpaper: dev and demo tooling for the designs.",
+  "scripts": {
+    "fixture": "node demo/make-fixture.mjs",
+    "errcount": "node demo/errcount-all.mjs",
+    "stills": "node demo/stills.mjs",
+    "geomcheck": "node designs/_shared/dev/geomcheck.mjs",
+    "audit": "node designs/_shared/dev-audit.mjs",
+    "scrub": "bash scripts/scrub-check.sh"
+  },
+  "devDependencies": {
+    "playwright-core": "1.62.0"
+  }
+}
