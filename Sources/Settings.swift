@@ -415,7 +415,7 @@ struct ReplayCache {
 // latest line (ReplayCache.latest, so analytics, github, hist and the rest are in it). Read once
 // at launch into the replay cache, so every page load, even the first, under a cover and with no
 // feed running, is sent a whole line (marked cached) and draws real, stale figures at once instead
-// of an empty layout (Ayush, 2026-11-05: "It can be stale ... but it should not be blank"). Written
+// of an empty layout (the brief, 2026-11-05: "It can be stale ... but it should not be blank"). Written
 // atomically, at most every `every` seconds while lines arrive, when the wallpaper pauses, when
 // the covered grace ends and at quit.
 enum LastLine {

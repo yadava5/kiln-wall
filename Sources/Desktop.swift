@@ -11,7 +11,7 @@
 // painted, also while covered (main.swift draws it unseen for this).
 //
 // Every picture is tagged with what it shows, its Look (design and the light or dark look it was
-// drawn in), in its file name, and is only ever shown as that look: Ayush saw the previous design for "a second or two" on
+// drawn in), in its file name, and is only ever shown as that look: the user saw the previous design for "a second or two" on
 // returning to the desktop after switching designs (2026-11-05). The host log had it: the desktop
 // picture stayed the old design for 168 s after a switch (the after-load snapshot fell under a
 // cover), and the overlay over a returning page was "the newest JPEG", of the old design. A

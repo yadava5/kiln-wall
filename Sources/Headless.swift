@@ -245,7 +245,7 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
     // (covered, on another Space, or behind a full-screen app). So the window IS ordered in, on the
     // main screen (its display link drives rAF, at that screen's rate), but fully transparent,
     // click-through, and below the desktop, where it is never seen and never counts as a window
-    // over the desktop (KilnWall's and LiveWall's coverage checks only look at the normal layer).
+    // over the desktop (KilnWall's and a video wallpaper app's coverage checks only look at the normal layer).
     // The window server will still call it occluded, so WebKit's occlusion check is turned off
     // for this web view (keepRenderingWhileUnseen). Measured 2026-11-04 on the stub page: with
     // the check on, here or with the window never ordered in, rAF never fired (the dot stayed

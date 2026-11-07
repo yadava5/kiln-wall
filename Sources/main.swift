@@ -1,7 +1,7 @@
 // KilnWall — a local HTML dashboard as the desktop wallpaper, fed live JSON.
 //
-// One borderless window per screen sits one level below the desktop icons (so above LiveWall's
-// video, which sits at the desktop level) and holds a WKWebView showing the chosen design,
+// One borderless window per screen sits one level below the desktop icons (so above a video
+// wallpaper app's window, which sits at the desktop level) and holds a WKWebView showing the chosen design,
 // ~/.config/kiln-wall/designs/<design>/index.html. Each JSON line from the feed (Feed.swift) is
 // handed to the page as its raw text, window.kiln.update(line), and the design, refresh period (100..1000 ms),
 // appearance and temperature unit (settings.json, see Settings.swift), with where the Dock is on
@@ -12,7 +12,7 @@
 // grace period at 1 s, its lines kept but not sent, so a quick return shows the latest state at
 // once (see coveredGrace).
 //
-// The page never shows blank (Ayush, 2026-11-05: "It can be stale ... but it should not be
+// The page never shows blank (the brief, 2026-11-05: "It can be stale ... but it should not be
 // blank"). Every page load is sent the last full state, kept on disk (LastLine), as its first
 // line, marked cached, so it draws real figures at once, with no feed and under a cover. A page
 // that loads or reloads while nobody sees it is drawn unseen (renderUnseen), not on the return.
@@ -69,7 +69,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     // state of a second ago at once. Measured 2026-11-05 (kiln-feed --stream --period-ms 1000,
     // 150 s, load average 2.3-3.5): own CPU 1.17% of a core (0.87-1.43% per 30 s), 2.5% with the
     // ps/netstat/pmset children it forks; a fresh start costs 90 ms of CPU and its first line
-    // comes one period later. So a full grace costs ~3 CPU-seconds; 120 s is Ayush's "a minute or
+    // comes one period later. So a full grace costs ~3 CPU-seconds; 120 s is the brief's "a minute or
     // two", and a cover that outlasts it stops the feed as before.
     private static let coveredGrace: TimeInterval = 120
     private static let coveredPeriodMs = 1000
@@ -136,7 +136,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     // The page's current load has drawn a full line (posted {painted}): only such a page is
     // snapshotted, for the desktop picture or an overlay. A load clears it. At 12:31 on
     // 2026-11-05 a snapshot of a page that had drawn no data (luma std 5.4, past the blank check)
-    // covered a reload, and Ayush saw an empty wallpaper.
+    // covered a reload, and the user saw an empty wallpaper.
     private var painted: Set<CGDirectDisplayID> = []
     // The look ("light" or "dark") this page was last seen to draw "auto" in, from its snapshot.
     private var autoDrawn: [CGDirectDisplayID: Look] = [:]
@@ -632,7 +632,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
     // A design switch or an appearance change while the wallpaper is paused with its windows in
     // (covered, locked, Low Power Mode, paused by you): the page is loaded or re-rendered and
-    // drawn NOW, so the desktop picture shows the new look before Ayush is back on the desktop and
+    // drawn NOW, so the desktop picture shows the new look before the user is back on the desktop and
     // the window holds it from the first frame of the return. cc3a2b8 deferred these to the
     // return, which showed the old design there for a second or so: in the Space animation (the
     // desktop picture) and in the window until the reload painted. WebKit does not draw a page it
@@ -1279,7 +1279,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     }
 
     // A new look (freshDue) is snapshotted as soon as it has drawn on screen, past the throttle and
-    // the settle, once: Ayush's return to the desktop must find the desktop picture of it.
+    // the settle, once: the user's return to the desktop must find the desktop picture of it.
     private func snapshotIfDue(_ display: CGDirectDisplayID, reason: String, force: Bool = false) {
         // Shown, running, and the page showing the look it is meant to (not mid-switch).
         guard running, isShown(display), pageShowsCurrent(display) else { return }
@@ -1322,7 +1322,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     // the same), else the newest picture of its look, which is then at most coverSnapshotEvery old.
     // The window server shows the window again before this app hears of the return, so a picture
     // put up on the return comes a frame or two late, and in that time the window showed whatever
-    // it held unseen. That was the black flash Ayush saw at 19:52 on 2026-11-05 ("the whole screen
+    // it held unseen. That was the black flash the user saw at 19:52 on 2026-11-05 ("the whole screen
     // blinks ... pitch black for a very, very, very short time"); the host log (pid 14084) has it:
     // - 480 s into a cover WebKit suspends the WebContent process ("View was recently visible
     //   (timeout: 480 sec)") and empties the web view until its first frame after the resume
@@ -1377,8 +1377,8 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
     // MARK: Windows
 
-    // One window per display. Screen parameters change far more often than the screens do (LiveWall
-    // measured every brightness-key step posting it), so an existing window is only moved, never
+    // One window per display. Screen parameters change far more often than the screens do (a video
+    // wallpaper app measured every brightness-key step posting it), so an existing window is only moved, never
     // rebuilt: rebuilding would reload the page and flash black.
     private func syncWindows() {
         let screens = Dictionary(NSScreen.screens.map { (Self.displayID($0), $0) }) { first, _ in first }
@@ -1418,7 +1418,7 @@ final class KilnWall: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
     private func makeWindow(for screen: NSScreen, _ display: CGDirectDisplayID) {
         let window = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
-        // Just under the desktop icons: above LiveWall (desktop level) and the Dock's wallpaper.
+        // Just under the desktop icons: above a video wallpaper app (desktop level) and the Dock's wallpaper.
         window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) - 1)
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         window.ignoresMouseEvents = true

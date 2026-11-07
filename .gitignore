@@ -1,2 +1,6 @@
 build/
 .DS_Store
+node_modules/
+__pycache__/
+# release scratch log, stills and scrub list: never published
+.release-notes/

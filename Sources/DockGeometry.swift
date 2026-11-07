@@ -1,5 +1,5 @@
 // Where the Dock is, for the page: window.kiln.config({..., dock}) -> Kiln.dock in kiln-runtime.js.
-// Ayush, 2026-11-05: "the dock can lengthen and shorten; if I open multiple apps, it might get
+// The request, 2026-11-05: "the dock can lengthen and shorten; if I open multiple apps, it might get
 // longer … adjust the things on top and bottom when the dock lengthens, and adjust them again when
 // it shortens."
 //
@@ -13,7 +13,7 @@
 //
 // Two ways to know it:
 //  - exact: KilnWall is trusted for Accessibility (AXIsProcessTrusted; never asked for here, never
-//    prompted: a permission is Ayush's to give). The Dock app's AXList is its tile strip.
+//    prompted: a permission is the user's to give). The Dock app's AXList is its tile strip.
 //  - estimate: otherwise, from the Dock's preferences and the running apps (see estimate()).
 // CGWindowList does not list the Dock's tile window and NSScreen.visibleFrame has no inset for an
 // auto-hidden Dock (both measured 2026-11-05 15:45), so these are the only two sources.
