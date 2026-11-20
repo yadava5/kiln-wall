@@ -26,11 +26,28 @@
 // over 48x30 at or above lightLumaMean: light). main.swift matches "auto" to the look the page
 // was last seen to draw it in.
 //
-// Each snapshot goes to a new file in ~/Library/Application Support/KilnWall/desktop/ (macOS
-// caches the picture by URL, so a rewritten file would not be re-read). Kept per display: the
-// newest two, the newest of each look (so switching back to a design has its picture at once)
-// and the one set. JPEG at quality 0.9: measured 2026-11-05 on a 3024x1964 ledger snapshot,
-// median of 7, JPEG 28.7 ms (1.9 MB), PNG 66.5 ms (1.2 MB), HEIC 0.9 68.1 ms (1.2 MB).
+// Each snapshot goes to a new file in ~/Library/Application Support/KilnWall/desktop/. Kept per
+// display: the newest two, the newest of each look (so switching back to a design has its
+// picture at once) and the one set. JPEG at quality 0.9: measured 2026-11-05 on a 3024x1964
+// ledger snapshot, median of 7, JPEG 28.7 ms (1.9 MB), PNG 66.5 ms (1.2 MB), HEIC 0.9 68.1 ms
+// (1.2 MB).
+//
+// A snapshot is never itself the desktop picture. macOS's wallpaper agent renders each picture it
+// is given into a screen-size BMP in its own cache (~/Library/Containers/com.apple.wallpaper.agent/
+// Data/Library/Caches/com.apple.wallpaper.caches/extension-com.apple.wallpaper.extension.image,
+// 17.8 MB at 3024x1964), named <sha256 of the file's path>-<w>-<h>-0-<the file's modification
+// time as a CFAbsoluteTime>, and never evicts one, not even for a deleted file or an older
+// version of the same path. Setting every new snapshot file left 2,419 of them, 40 GB, by
+// 2026-11-18 (decoded 2026-11-18 on every BMP written during a test; a path rewritten, so with a
+// new mtime, got a second BMP beside its first). It renders only when the desktop is composited:
+// a picture set while it is covered costs nothing until it is seen.
+//
+// So each look has one file, look-<display>@<design>@<light|dark>[@solid].jpg, set as it is:
+// same path, same mtime, same BMP, however often it is set again. It is replaced with the newest
+// snapshot only when it is missing, its design's files have changed since it was written, or it
+// is older than lookRefresh. A cost of ~17.8 MB per display per look per refresh, against one per
+// snapshot (up to one a minute) before. The price: the desktop picture, seen in Mission Control
+// and Space transitions, can show data up to lookRefresh old, though always of the right look.
 //
 // The user's own picture is saved per display (OriginalDesktop, settings.json) before the first
 // change and put back on Quit and when matching is switched off. A test instance
@@ -118,6 +135,8 @@ final class DesktopMatcher {
     private var serial = 0
     // The file each display's picture was last set to: never pruned.
     private var lastSet: [CGDirectDisplayID: String] = [:]
+    // A look file older than this is replaced by the next snapshot of its look.
+    private static let lookRefresh: TimeInterval = 7 * 24 * 3600
     private let webViewFor: (CGDirectDisplayID) -> WKWebView?
     private let testInstance = TestHome.url != nil
 
@@ -272,17 +291,59 @@ final class DesktopMatcher {
         }
         guard saveOriginal(display, screen) else { return }
         let started = DispatchTime.now().uptimeNanoseconds
+        let solid = url.lastPathComponent.hasSuffix("@solid.jpg")
+        let file = Self.lookURL(display, look, solid: solid)
+        let stale = Self.staleness(file, look)
+        // Always set, even when unchanged: the picture is per Space, and the same path and mtime
+        // is the same BMP in the agent's cache, so a repeat costs nothing there.
         do {
-            try NSWorkspace.shared.setDesktopImageURL(url, for: screen, options: [
+            if let stale {
+                try? FileManager.default.removeItem(at: file)
+                try FileManager.default.copyItem(at: url, to: file)  // an APFS clone, the snapshot's mtime
+                log("desktop: display \(display) look file \(file.lastPathComponent) replaced (\(stale))")
+            }
+            try NSWorkspace.shared.setDesktopImageURL(file, for: screen, options: [
                 .imageScaling: NSImageScaling.scaleProportionallyUpOrDown.rawValue,
                 .allowClipping: true,
             ])
         } catch {
-            return log("desktop: display \(display): cannot set \(url.path): \(error.localizedDescription)")
+            return log("desktop: display \(display): cannot set \(file.path) from \(url.lastPathComponent): \(error.localizedDescription)")
         }
         lastSet[display] = url.lastPathComponent
-        log(String(format: "desktop: set display %u to %@, design %@, appearance %@; %@, set %.1f ms (%@)",
-                   display, url.path, look.design, look.appearance, detail, Self.ms(since: started), reason))
+        log(String(format: "desktop: set display %u to %@ (%@), design %@, appearance %@; %@, set %.1f ms (%@)",
+                   display, file.lastPathComponent, stale == nil ? "unchanged" : "from \(url.lastPathComponent)",
+                   look.design, look.appearance, detail, Self.ms(since: started), reason))
+    }
+
+    // The one file a look is shown from as the desktop picture. Not a DesktopPicture name, so
+    // pictures() and prune() never see it.
+    nonisolated static func lookURL(_ display: CGDirectDisplayID, _ look: Look, solid: Bool) -> URL {
+        let design = look.design.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "_"
+        return folder.appendingPathComponent("look-\(display)@\(design)@\(look.appearance)\(solid ? "@solid" : "").jpg")
+    }
+
+    // Why the look file must be replaced, or nil if it may be set as it is.
+    private static func staleness(_ file: URL, _ look: Look) -> String? {
+        guard let written = (try? FileManager.default.attributesOfItem(atPath: file.path))?[.modificationDate] as? Date
+        else { return "none yet" }
+        let age = Date().timeIntervalSince(written)
+        if age > lookRefresh { return String(format: "%.1f days old", age / 86400) }
+        if let changed = designChanged(look.design), changed > written { return "its design changed since" }
+        return nil
+    }
+
+    // The newest modification time under the design's folder (nil for "_page" or no folder).
+    private static func designChanged(_ design: String) -> Date? {
+        guard Designs.isValidID(design) else { return nil }
+        let root = Designs.root.appendingPathComponent(design, isDirectory: true)
+        guard let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey])
+        else { return nil }
+        var newest: Date?
+        for case let file as URL in files {
+            if let date = try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+               newest.map({ date > $0 }) ?? true { newest = date }
+        }
+        return newest
     }
 
     // MARK: The user's own picture
