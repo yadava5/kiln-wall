@@ -426,7 +426,7 @@ class Ledger:
     still waiting for their answer. Aggregates are per local day, so the
     window slides by dropping whole days.
     """
-    VERSION = 3          # 3: main/sub and per-agent-type tokens, gp per session
+    VERSION = 4          # 4: session titles (ai-title / custom-title) per main file
 
     def __init__(self):
         self.lk = threading.RLock()
@@ -552,6 +552,22 @@ class Ledger:
         now = time.time()
         for ln in data.split(b"\n"):
             if not ln:
+                continue
+            if main and ln.startswith((b'{"type":"ai-title"', b'{"type":"custom-title"')):
+                # The session's title as /resume and the terminal tab show it.
+                # sessions/<pid>.json keeps a folder-derived placeholder
+                # ("documents-18") until the user renames, so it is not used for
+                # this. Matched at line start only: a tool result quoting these
+                # strings is nested inside another entry.
+                try:
+                    d = json.loads(ln)
+                except ValueError:
+                    continue
+                key, field = ("ct", "customTitle") if d.get("type") == "custom-title" \
+                    else ("ai", "aiTitle")
+                v = d.get(field)
+                if isinstance(v, str) and v.strip():
+                    rec[key] = v.strip()[:120]
                 continue
             if b'"usage"' in ln and b'"type":"assistant"' in ln:
                 try:
@@ -1885,6 +1901,19 @@ class Feed:
                 return True
         return False
 
+    @staticmethod
+    def _title(d, rec):
+        """The name /resume shows: the latest /rename, else the AI title, else
+        whatever sessions/<pid>.json holds. That json name is a folder-derived
+        placeholder ("documents-18", nameSource "derived") that Claude Code only
+        rewrites on a rename, so preferring it froze names until one."""
+        rec = rec or {}
+        if rec.get("ct"):
+            return rec["ct"]
+        if d.get("nameSource") == "user" and d.get("name"):
+            return d["name"]
+        return rec.get("ai") or d.get("name") or ""
+
     def sessions(self, now):
         live, other = self._live(now)
         ptab = {p[0]: p for p in self.sys.procs}
@@ -1902,11 +1931,14 @@ class Feed:
             keep.append((d, row))
         live = keep
         pairs = []
+        titles = {}
         for d, row in live:
             sid = d.get("sessionId") or ""
-            if d.get("name"):
-                self.names[sid] = d["name"]
-            pairs.append((sid, self._main_path(sid, now)))
+            mp = self._main_path(sid, now)
+            nm = self._title(d, self.ledger.main_rec(mp) if mp else None)
+            if nm:
+                self.names[sid] = titles[sid] = nm
+            pairs.append((sid, mp))
         self.ledger.live = pairs
         self.agents.poll(pairs, now)
         pending = {}
@@ -1932,7 +1964,7 @@ class Feed:
             win = 200000 if model and "haiku" in model else CTX_WINDOW
             started = (d.get("startedAt") or 0) / 1000.0
             out.append({
-                "sid": sid, "name": d.get("name") or sid[:8], "cwd": d.get("cwd") or "",
+                "sid": sid, "name": titles.get(sid) or sid[:8], "cwd": d.get("cwd") or "",
                 # kind: "interactive" = open in a terminal (including a bg-hosted
                 # session whose terminal client is attached); "bg" = no window.
                 "pid": pid,
