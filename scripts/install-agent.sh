@@ -14,8 +14,11 @@
 # The feed it runs is the one KilnWall runs: $KILN_FEED_SCRIPT, else the first that exists of
 # ~/.config/kiln-wall/feed/kiln-feed.py (scripts/install.sh puts it there) and
 # ~/.config/kitty/kiln-feed.py. The plist is written with your paths when you run this; this
-# script itself names nobody's. Low priority (ProcessType Background), restarted if it exits
-# (KeepAlive), and it logs nothing to disk. `python3 <feed> --status` lists its subscribers.
+# script itself names nobody's. ProcessType Interactive by default: on the performance cores
+# it takes about half the CPU-seconds it takes at Background (docs/shared-feed.md). Set
+# KILN_FEED_PROCESS_TYPE=Background to trade CPU-seconds for energy on a Mac that lives on
+# battery. Restarted if it exits (KeepAlive), and it logs nothing to disk.
+# `python3 <feed> --status` lists its subscribers.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -54,6 +57,11 @@ esac
 # Loaded as a module, not run as the script: Python compiles the script it runs on every start
 # and never caches that, and the compiler's ~10 MB stays with the process (measured 2026-11-27:
 # 28.8 MB RSS run as the script, 18.4 MB loaded as a module from its cached bytecode).
+process_type="${KILN_FEED_PROCESS_TYPE:-Interactive}"
+case $process_type in Interactive|Standard|Adaptive|Background) ;; *)
+  echo "install-agent: KILN_FEED_PROCESS_TYPE must be Interactive, Standard, Adaptive or Background" >&2
+  exit 2
+esac
 loader='import importlib.util as u, sys; s = u.spec_from_file_location("kiln_feed", sys.argv[1]); m = u.module_from_spec(s); s.loader.exec_module(m); sys.argv = sys.argv[1:]; m.main()'
 
 /bin/mkdir -p "$HOME/Library/LaunchAgents"
@@ -77,13 +85,18 @@ loader='import importlib.util as u, sys; s = u.spec_from_file_location("kiln_fee
   <key>KeepAlive</key>
   <true/>
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>$process_type</string>
 </dict>
 </plist>
 EOF
 /usr/bin/plutil -lint "$plist" >/dev/null
 
 /bin/launchctl bootout "$domain/$label" 2>/dev/null || true
+# bootout returns before the job is gone; a bootstrap that lands first fails with error 5.
+for _ in $(/usr/bin/seq 50); do
+  /bin/launchctl print "$domain/$label" >/dev/null 2>&1 || break
+  /bin/sleep 0.1
+done
 /bin/launchctl bootstrap "$domain" "$plist"
 sock="$HOME/Library/Application Support/kiln-feed/feed.sock"
 for _ in $(/usr/bin/seq 50); do [[ -S $sock ]] && break; /bin/sleep 0.1; done

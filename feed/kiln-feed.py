@@ -1505,8 +1505,8 @@ class Sys:
             self._ps(now, force)
 
     # --serve sets this: the periodic ps runs on a thread, so the loop that pushes session
-    # changes never waits on the fork (measured 2026-11-27: 49 ms of wall time, 182 ms at the
-    # LaunchAgent's background QoS). The table is replaced whole when it lands.
+    # changes never waits on the fork (measured 2026-11-27: 49 ms of wall time, 182 ms at
+    # background QoS). The table is replaced whole when it lands.
     ps_async = False
 
     def _ps(self, now, force):
@@ -2680,8 +2680,8 @@ EVENT_SETTLE_S = 0.01     # files written together (a lock and its chime line) l
 EVENT_GAP_S = 0.05        # at most 20 pushes a second between periods
 MACHINE_COLD_S = 3.0      # machine rates older than this are re-based before they are sent
 O_EVTONLY = getattr(os, "O_EVTONLY", 0x8000)
-# The settle is a kqueue timer marked NOTE_CRITICAL | NOTE_USECONDS: as a LaunchAgent the feed
-# runs at background QoS, whose ordinary timeouts the kernel coalesces by up to ~200 ms
+# The settle is a kqueue timer marked NOTE_CRITICAL | NOTE_USECONDS: the LaunchAgent can be
+# installed at background QoS (KILN_FEED_PROCESS_TYPE=Background), whose ordinary timeouts the kernel coalesces by up to ~200 ms
 # (measured: a push's p90 went from 45 ms to 198 ms under `taskpolicy -b`).
 _TIMER_FLAGS = 0x20 | 0x2
 

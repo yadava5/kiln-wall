@@ -74,8 +74,8 @@ same subscriptions.
 Medians per change. The one slow new reading (930 ms) is a session start: a new pid needs a
 `ps`, which the feed runs at most once a second.
 
-**At the agent's low priority.** The LaunchAgent runs at background QoS (`ProcessType`
-Background). Measured the same way under `taskpolicy -b`, the first try had a p90 of 198 ms:
+**At background QoS.** The LaunchAgent first ran at background QoS (`ProcessType`
+Background; it now runs Interactive, see Cost). Measured the same way under `taskpolicy -b`, the first try had a p90 of 198 ms:
 a `ps` fork takes 182 ms there (49 ms normally) and the loop waited on it, and the 10 ms settle
 was a timeout the kernel may coalesce. So in `--serve` the periodic `ps` runs on a thread and the
 settle is a `NOTE_CRITICAL` kqueue timer. Then, at background QoS, every state change above came
@@ -103,8 +103,22 @@ cores at normal QoS). They run the same work at a lower clock, so it takes 3 to 
 for far less energy. Same code, same subscription, alternated: 1.2 to 1.4% CPU and 10.4 to
 11.0 mW at normal QoS, 4.4 to 4.9% and 1.6 to 2.4 mW at background. At normal QoS the shared
 feed also takes fewer CPU-seconds than the two copies (visible, an earlier run: 4.28% to 1.97%),
-at 4 to 7 times the agent's energy. Background is the default for that reason; remove
-`ProcessType` from the plist to make the other trade.
+at 4 to 7 times the agent's energy.
+
+**Interactive is the default** (2026-11-27). A Mac that is on power most of the day gains
+nothing from saved milliwatts, and Background costs CPU-seconds and a slower tail. The live
+agent, island subscribed, 60 s after a 35 s warm-up, alternated, two rounds, CPU own + forks:
+
+| `ProcessType` | CPU (own + forks) |
+|---|---|
+| Background | 4.14%, 3.38% |
+| Standard | 1.83%, 2.33% |
+| Interactive | 1.86%, 2.38% |
+
+Push latency for a waiting change and its answer (scratch `HOME`, 50 changes per run, two runs
+each): normal QoS 12 ms median, p90 14 to 16 ms, max 23 ms; background 13 to 14 ms median, p90
+20 to 21 ms, max 110 ms. `KILN_FEED_PROCESS_TYPE=Background scripts/install-agent.sh` makes the
+energy trade instead.
 
 Also gone: each return to the desktop past the 120 s grace used to start a new child, about
 0.15 CPU-seconds and 0.6 s before its first line (measured three times). Now KilnWall subscribes,
@@ -119,7 +133,8 @@ scripts/install-agent.sh --uninstall  # stops it, removes the plist; KilnWall go
 ```
 
 It runs the feed KilnWall would run (`$KILN_FEED_SCRIPT`, else `~/.config/kiln-wall/feed/`,
-else `~/.config/kitty/`), with `ProcessType` Background and `KeepAlive`. Environment variables
+else `~/.config/kitty/`), with `ProcessType` Interactive (or `$KILN_FEED_PROCESS_TYPE`) and
+`KeepAlive`. Environment variables
 the feed reads (`KILN_LAT`, `GH_TOKEN`, ...) come from launchd's environment, as KilnWall's do
 when it is opened from Finder: `launchctl setenv`, then `launchctl kickstart -k gui/$UID/<label>`.
 
