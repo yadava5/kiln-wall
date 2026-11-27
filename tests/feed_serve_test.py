@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""The shared feed's protocol: kiln-feed.py --serve against real subscribers, in a scratch HOME.
+
+    python3 tests/feed_serve_test.py        (macOS: the feed reads the machine through Mach/IOKit)
+
+A fake Claude session (a symlink named `claude` to /bin/sleep, so ps lists it as one) owns a
+sessions json, a transcript, chime.jsonl and an ask-chime lock in the scratch HOME, written the
+way Claude Code and the hooks write them. Nothing outside the scratch folder is read or written.
+"""
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+FEED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "feed", "kiln-feed.py")
+SID = "test-0000-4000-8000-000000000001"
+
+
+def iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % int((t % 1) * 1000)
+
+
+def append(path, obj):
+    with open(path, "a") as f:
+        f.write(json.dumps(obj, separators=(",", ":")) + "\n")
+
+
+class Home:
+    """A scratch HOME with one live fake session, idle."""
+
+    def __init__(self):
+        self.root = tempfile.mkdtemp(prefix="kf")
+        self.claude = os.path.join(self.root, ".claude")
+        for d in ("sessions", "projects/-t", "cache"):
+            os.makedirs(os.path.join(self.claude, d))
+        self.tr = os.path.join(self.claude, "projects/-t", SID + ".jsonl")
+        self.chime = os.path.join(self.claude, "cache/chime.jsonl")
+        self.lock = os.path.join(self.claude, "cache/ask-chime-%s.json" % SID)
+        self.sock = os.path.join(self.root, "Library/Application Support/kiln-feed/feed.sock")
+        os.symlink("/bin/sleep", os.path.join(self.root, "claude"))
+        t = time.time() - 60
+        self.user(t)
+        append(self.tr, {"isSidechain": False, "type": "system", "subtype": "turn_duration",
+                         "timestamp": iso(t + 1)})
+        open(self.chime, "w").close()
+        # No inherited stdout, so nothing left running can hold a caller's pipe open.
+        self.proc = subprocess.Popen([os.path.join(self.root, "claude"), "600"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(os.path.join(self.claude, "sessions/%d.json" % self.proc.pid), "w") as f:
+            json.dump({"pid": self.proc.pid, "sessionId": SID, "cwd": "/tmp/t", "kind": "interactive",
+                       "startedAt": int(time.time() * 1000), "name": "test-session",
+                       "nameSource": "user"}, f)
+        self.env = dict(os.environ, HOME=self.root, KILN_GITHUB="0", PYTHONUNBUFFERED="1")
+        for k in ("KILN_LAT", "KILN_LON", "KILN_FEED_SOCK"):
+            self.env.pop(k, None)
+        self.servers = []
+
+    def user(self, t):
+        append(self.tr, {"parentUuid": None, "isSidechain": False, "type": "user",
+                         "message": {"role": "user", "content": "go"}, "timestamp": iso(t),
+                         "sessionId": SID})
+
+    def serve(self):
+        p = subprocess.Popen([sys.executable, FEED, "--serve"], env=self.env,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        self.servers.append(p)
+        for _ in range(200):               # answering, not merely there (a stale file is)
+            try:
+                Client(self, "").close()
+                return p
+            except OSError:
+                time.sleep(0.025)
+        raise AssertionError("no socket answering after 5 s")
+
+    def close(self):
+        for p in self.servers:
+            if p.poll() is None:
+                p.terminate()
+                p.wait(10)
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+class Client:
+    def __init__(self, home, commands="", rcvbuf=None):
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if rcvbuf:
+            self.s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+        cwd = os.getcwd()
+        os.chdir(os.path.dirname(home.sock))      # the scratch path can exceed sun_path
+        try:
+            self.s.connect("feed.sock")
+        finally:
+            os.chdir(cwd)
+        self.buf = b""
+        self.q = []                        # (arrival, line) received, not yet taken
+        if commands:
+            self.send(commands)
+
+    def send(self, text):
+        self.s.sendall(text.encode())
+
+    def _fill(self, timeout):
+        """One read of up to `timeout`; False on timeout or close."""
+        self.s.settimeout(max(0.001, timeout))
+        try:
+            chunk = self.s.recv(1 << 20)
+        except socket.timeout:
+            return False
+        if not chunk:
+            return False
+        now = time.time()
+        self.buf += chunk
+        while b"\n" in self.buf:
+            ln, self.buf = self.buf.split(b"\n", 1)
+            self.q.append((now, json.loads(ln)))
+        return True
+
+    def lines(self, seconds):
+        """Every line received so far plus those arriving within `seconds`."""
+        end = time.time() + seconds
+        while time.time() < end and self._fill(end - time.time()):
+            pass
+        out, self.q = self.q, []
+        return out
+
+    def until(self, pred, seconds=3.0):
+        """The first line for which pred(line) holds, with its arrival time, as soon as it
+        arrives; else (None, None). Lines before it are taken too."""
+        end = time.time() + seconds
+        while True:
+            while self.q:
+                t, d = self.q.pop(0)
+                if pred(d):
+                    return t, d
+            if time.time() >= end or not self._fill(end - time.time()):
+                return None, None
+
+    def close(self):
+        self.s.close()
+
+
+def state(d):
+    ss = (d.get("claude") or {}).get("sessions")
+    if ss is None:
+        return None
+    return next((s["state"] for s in ss if s["sid"] == SID), "gone")
+
+
+def status(home):
+    c = Client(home, "status\n")
+    _, d = c.until(lambda d: "status" in d)
+    c.close()
+    return d["status"]
+
+
+class ServeTest(unittest.TestCase):
+    def setUp(self):
+        self.home = Home()
+        self.clients = []
+        try:
+            self.server = self.home.serve()
+        except BaseException:
+            self.home.close()              # tearDown does not run after a failed setUp
+            raise
+
+    def tearDown(self):
+        for c in self.clients:
+            c.close()
+        self.home.close()
+
+    def client(self, commands="", rcvbuf=None):
+        c = Client(self.home, commands, rcvbuf)
+        self.clients.append(c)
+        return c
+
+    def test_nothing_before_want_then_a_whole_line_at_once(self):
+        c = self.client("hello t\n")
+        self.assertEqual(c.lines(0.6), [], "a line before any want")
+        t0 = time.time()
+        c.send("want claude\n")
+        got = c.lines(0.3)
+        self.assertTrue(got, "no line within 0.3 s of want")
+        self.assertLess(got[0][0] - t0, 0.3)
+        d = got[0][1]
+        self.assertEqual(sorted(d), ["claude", "feed", "t", "v"])
+        self.assertEqual(sorted(d["claude"]), ["agents_running", "events", "limits", "sessions",
+                                               "sessions_other", "tokens"])
+        self.assertEqual(state(d), "idle")
+        self.assertEqual(d["claude"]["sessions"][0]["name"], "test-session")
+        self.assertEqual(d["feed"]["subs"], 1)
+
+    def test_blocks_and_sticky_rule_are_per_subscriber(self):
+        wall = self.client("hello wall\nwant all\nperiod 200\n")
+        isl = self.client("hello island\nwant claude\nperiod 200\n")
+        w, i = wall.lines(1.5), isl.lines(0.05)
+        i += isl.lines(1.0)
+        self.assertGreaterEqual(len(w), 4)
+        self.assertGreaterEqual(len(i), 4)
+        self.assertTrue({"sys", "claude", "weather", "github", "analytics"} <= set(w[0][1]))
+        for _, d in i:
+            self.assertEqual(set(d) - {"v", "t", "feed", "claude"}, set(), "island got a block it did not want")
+        # Sticky blocks: on the first line, then only when changed (events never change here).
+        for lines in (w, i):
+            self.assertIn("events", lines[0][1]["claude"])
+            self.assertTrue(all("events" not in d["claude"] for _, d in lines[1:]))
+        self.assertIn("analytics", w[0][1])
+        self.assertFalse(any("analytics" in d for _, d in w[1:3]))
+        # A subscriber arriving now still gets every sticky block on its own first line.
+        late = self.client("want claude\n")
+        _, d = late.until(lambda d: True)
+        self.assertIn("events", d["claude"])
+        self.assertIn("limits", d["claude"])
+
+    def test_each_subscriber_has_its_own_period(self):
+        fast = self.client("want claude\nperiod 200\n")
+        slow = self.client("want claude\nperiod 1000\n")
+        time.sleep(2.2)
+        nf, ns = len(fast.lines(0.05)), len(slow.lines(0.05))
+        self.assertTrue(9 <= nf <= 13, "fast got %d lines in 2.2 s at 200 ms" % nf)
+        self.assertTrue(2 <= ns <= 4, "slow got %d lines in 2.2 s at 1000 ms" % ns)
+
+    def test_a_session_change_is_pushed_between_periods(self):
+        c = self.client("want claude\nperiod 1000\n")
+        c.until(lambda d: state(d) == "idle")
+        h = self.home
+        for name, act, want in (
+                ("lock", lambda: json.dump({"pid": os.getpid(), "since": time.time()}, open(h.lock, "w")),
+                 "waiting"),
+                ("unlock", lambda: os.remove(h.lock), "idle"),
+                ("prompt", lambda: h.user(time.time()), "working"),
+                ("chime stop", lambda: append(h.chime, {"ts": time.time(), "sid": SID, "event": "stop",
+                                                        "verdict": "chime", "why": "done"}), "idle"),
+                # killed and reaped, as its shell reaps a real claude (a zombie still
+                # answers kill(pid, 0), so it would stay listed until ps drops it)
+                ("exit", lambda: (h.proc.kill(), h.proc.wait()), "gone")):
+            # Just after a periodic line, so the next is ~0.95 s away and only a push is
+            # faster. (No step here is a prompt within 0.5 s of a stop: kiln-feed reads that
+            # as the same turn.)
+            c.lines(0)
+            c.until(lambda d: True, 2.0)
+            time.sleep(0.05)
+            t0 = time.time()
+            act()
+            t, d = c.until(lambda d: state(d) == want, 2.0)
+            self.assertIsNotNone(t, "%s: never %s" % (name, want))
+            self.assertLess(t - t0, 0.25, "%s: %s after %.0f ms, not pushed" % (name, want, (t - t0) * 1000))
+
+    def test_a_streaming_reply_pushes_nothing(self):
+        h = self.home
+        c = self.client("want claude\nperiod 1000\n")
+        h.user(time.time())
+        c.until(lambda d: state(d) == "working")
+        time.sleep(0.05)
+        c.lines(0.01)
+        n0 = status(h)["pushes"]
+        for k in range(20):            # a reply landing in the transcript, 20 writes in 2 s
+            append(h.tr, {"isSidechain": False, "type": "assistant", "timestamp": iso(time.time()),
+                          "message": {"id": "m%d" % k, "role": "assistant", "model": "test",
+                                      "content": [{"type": "text", "text": "x" * 200}]}})
+            time.sleep(0.1)
+        got = c.lines(0.2)
+        self.assertEqual(status(h)["pushes"], n0, "a streaming reply caused pushes")
+        self.assertLessEqual(len(got), 4)
+        self.assertTrue(all(state(d) == "working" for _, d in got))
+
+    def test_costly_blocks_run_only_while_someone_wants_them(self):
+        isl = self.client("want claude\nperiod 200\n")
+        isl.until(lambda d: True)
+        s0 = status(self.home)
+        time.sleep(1.2)
+        s1 = status(self.home)
+        self.assertEqual(s1["machine_at"], s0["machine_at"], "machine sampled for a claude-only subscriber")
+        self.assertIsNone(s1["analytics_at"], "analytics derived for a claude-only subscriber")
+        wall = self.client("want all\nperiod 200\n")
+        wall.until(lambda d: "sys" in d)
+        time.sleep(0.5)
+        s2 = status(self.home)
+        self.assertGreater(s2["machine_at"], s1["machine_at"])
+        self.assertIsNotNone(s2["analytics_at"])
+        wall.close()
+        self.clients.remove(wall)
+        time.sleep(0.5)
+        s3 = status(self.home)
+        time.sleep(1.0)
+        s4 = status(self.home)
+        self.assertEqual(s4["machine_at"], s3["machine_at"], "machine still sampled after the wall left")
+        self.assertEqual([x["want"] for x in s4["subs"]], [["claude"]])
+
+    def test_a_reader_that_stops_reading_holds_up_nobody(self):
+        # The server's 64 KB send buffer is what fills first (measured: 30 lines, 64 KB, in
+        # 3 s here), so 5 s of unread lines at 100 ms back up.
+        stuck = self.client("hello stuck\nwant all\nperiod 100\n", rcvbuf=2048)
+        ok = self.client("hello ok\nwant claude\nperiod 200\n")
+        n = 0
+        end = time.time() + 5.0
+        while time.time() < end:
+            n += len(ok.lines(0.2))
+        self.assertGreaterEqual(n, 22, "the reading subscriber got %d lines in 5 s at 200 ms" % n)
+        subs = {x["name"]: x for x in status(self.home)["subs"]}
+        self.assertGreater(subs["stuck"]["skipped"], 0)
+        # Once it reads again: its first line (never read until now), the lines that were
+        # buffered (sticky blocks left out, as nothing changed), then, after the dropped ones,
+        # a line carrying every sticky block again.
+        got = stuck.lines(1.5)
+        self.assertIn("events", got[0][1]["claude"])
+        later = [d for _, d in got[1:] if "events" in d["claude"]]
+        self.assertTrue(later, "no line with the sticky blocks after the dropped ones")
+        self.assertIn("analytics", later[0])
+
+    def test_status_one_server_and_the_socket_removed_on_exit(self):
+        self.client("hello wall\nwant all\nperiod 500\n").until(lambda d: True)
+        st = status(self.home)
+        self.assertEqual([(x["name"], x["period_ms"]) for x in st["subs"]], [("wall", 500)])
+        self.assertEqual(os.stat(self.home.sock).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(os.path.dirname(self.home.sock)).st_mode & 0o777, 0o700)
+        second = subprocess.run([sys.executable, FEED, "--serve"], env=self.home.env,
+                                capture_output=True, text=True, timeout=20)
+        self.assertIn("another --serve", second.stderr)
+        self.assertEqual(status(self.home)["pid"], self.server.pid, "the first server stopped serving")
+        self.server.send_signal(signal.SIGTERM)
+        self.assertEqual(self.server.wait(10), 0)
+        self.assertFalse(os.path.exists(self.home.sock), "socket left after exit")
+
+    def test_a_socket_left_by_a_crash_is_replaced(self):
+        self.server.kill()
+        self.server.wait()
+        self.assertTrue(os.path.exists(self.home.sock))
+        self.home.serve()
+        c = self.client("want claude\n")
+        _, d = c.until(lambda d: True)
+        self.assertEqual(state(d), "idle")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

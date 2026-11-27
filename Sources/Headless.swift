@@ -176,7 +176,9 @@ final class Headless: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKS
     private static let rafProbe: TimeInterval = 2
 
     private let options: HeadlessOptions
-    private let feed = Feed()
+    // A child of its own, never the shared feed: --measure measures that child, and a snapshot
+    // must not depend on what else is running.
+    private let feed = Feed(shared: false)
     private let settings = Settings.load()
     private lazy var target = options.design.map { PageTarget.design($0) } ?? PageTarget.resolve(settings.design)
     private lazy var periodMs = options.periodMs ?? settings.periodMs
