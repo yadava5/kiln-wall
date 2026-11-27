@@ -120,6 +120,25 @@ each): normal QoS 12 ms median, p90 14 to 16 ms, max 23 ms; background 13 to 14 
 20 to 21 ms, max 110 ms. `KILN_FEED_PROCESS_TYPE=Background scripts/install-agent.sh` makes the
 energy trade instead.
 
+**The process table in process** (2026-11-27). The forks in that column were all `ps`, the
+table that tells live sessions: 12 a minute, every one on the 5 s phase (counted from the
+agent's children over 60 s; the on-demand read for a new session added none), at 42 ms of
+child CPU each inside the agent against 28 ms from a shell. It now reads libproc in process,
+1.9 ms of CPU a table (13.5 ms for the first, which reads every name), with `ps` kept as the
+fallback. The live agent, island subscribed, 35 s warm-up, 60 s, alternated, two rounds:
+
+| | own | forks | total |
+|---|---|---|---|
+| `ps` fork | 1.36%, 1.22% | 0.85%, 0.80% | 2.22%, 2.02% |
+| libproc | 1.43%, 1.58% | 0 | 1.43%, 1.58% |
+
+The own column moves with the machine's load more than with the change (the Mac was compiling
+throughout). Two scratch copies run side by side, so under the same load: 1.17% and 1.04% total
+with `ps`, 0.60% and 0.47% with libproc, own CPU within 0.1%. Memory side by side after 90 s:
+16.6 against 16.5 MB RSS, 13.3 MB physical footprint each. What it cannot read unprivileged:
+another user's CPU and memory (ps is setuid root), so `top_cpu` and `top_mem` rank the user's
+own processes only.
+
 Also gone: each return to the desktop past the 120 s grace used to start a new child, about
 0.15 CPU-seconds and 0.6 s before its first line (measured three times). Now KilnWall subscribes,
 and its first line comes at once, or 0.5 s later when machine rates need a fresh baseline.
@@ -145,4 +164,6 @@ before `want`, blocks and sticky blocks per subscriber, a period per subscriber,
 within 250 ms (just after a periodic line, so only a push is faster), a streaming reply pushing
 nothing, costly blocks off without a subscriber that wants them, a reader that stops reading
 holding up nobody, one server per socket, the socket removed on exit and replaced after a crash.
-CI runs it on macOS.
+It also holds the in-process process table to `ps`: the same pids, parents and ages, the same
+names and resident sizes for the user's own processes, and about 100% for a process spinning a
+core. CI runs it on macOS.

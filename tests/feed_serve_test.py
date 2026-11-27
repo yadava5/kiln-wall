@@ -341,5 +341,74 @@ class ServeTest(unittest.TestCase):
         self.assertEqual(state(d), "idle")
 
 
+def sampler():
+    """kiln-sample.py, loaded the way kiln-feed loads it."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "kiln_sample_test", os.path.join(os.path.dirname(FEED), "kiln-sample.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+class ProcessTableTest(unittest.TestCase):
+    """process_table() reads libproc in process; ps is the reference it must agree with."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.S = sampler()
+
+    def test_the_table_is_the_one_ps_prints(self):
+        S = self.S
+        a = S._table_libproc()
+        self.assertTrue(a, "the libproc table is empty or unusable (process_table would fork ps)")
+        ps = S._table_ps()
+        b = S._table_libproc()
+        self.assertTrue(ps)
+        A, B, P = ({r[0]: r for r in t} for t in (a, b, ps))
+        both = set(A) & set(B)
+        # Listed before and after ps ran, so alive while it ran: ps must list it.
+        self.assertEqual(sorted(both - set(P)), [])
+        # ps itself, and anything born after one table and gone before the other.
+        missing = set(P) - set(A) - set(B)
+        self.assertLessEqual(len(missing), 3, sorted((p, P[p][5]) for p in missing))
+        bad = {"ppid": [], "etime": [], "comm": [], "rss": []}
+        own = 0
+        for pid in sorted(both & set(P)):
+            r, p = A[pid], P[pid]
+            if r[1] != p[1]:
+                bad["ppid"].append((pid, r[1], p[1]))
+            if abs(r[2] - p[2]) > 2:
+                bad["etime"].append((pid, r[2], p[2]))
+            if r[4]:                     # the user's own process: read in full
+                own += 1
+                if r[5] != p[5]:
+                    bad["comm"].append((pid, r[5], p[5]))
+                if abs(r[4] - p[4]) > max(8 << 20, p[4] // 4):
+                    bad["rss"].append((pid, r[4], p[4]))
+        self.assertIn(os.getpid(), A)
+        self.assertEqual(A[os.getpid()][5], P[os.getpid()][5], "this process's own comm")
+        self.assertGreater(own, 0)
+        # A process exec'ing, exiting or growing between the two reads may differ once or twice.
+        for k, v in bad.items():
+            self.assertLessEqual(len(v), 2, "%s differs from ps: %r" % (k, v[:8]))
+
+    def test_cpu_reads_a_spinning_process_as_busy(self):
+        S = self.S
+        spin = subprocess.Popen([sys.executable, "-c", "while True: pass"])
+        try:
+            time.sleep(0.5)
+            S._table_libproc()
+            time.sleep(1.5)
+            row = next((r for r in S._table_libproc() if r[0] == spin.pid), None)
+            self.assertIsNotNone(row)
+            # ps reads ~100 here. CPU time arrives in Mach units, 125/3 ns on Apple silicon.
+            self.assertGreater(row[3], 40, row)
+            self.assertLess(row[3], 150, row)
+        finally:
+            spin.kill()
+            spin.wait()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

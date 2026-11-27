@@ -41,10 +41,11 @@ COST (see kiln-sample.py for each sampler's measured price). Every tick:
 CPU, per-core, memory, swap (Mach/sysctl via ctypes) and GPU + disk I/O
 (IOKit in-process): all ~0 ms, no fork. Battery: IOKit's power-source API in
 process (0.03 ms), re-read when powerd posts a change (notify_check, every
-tick) and every 2 s regardless. Forks on their own slow phases: ps 5 s (and
-at once, at most once a second, when a sessions/*.json names a live pid ps
-has not listed yet), netstat 1 s. A listed session whose pid has died is
-dropped on the next tick (kill(pid, 0)), not at the next ps. chime.jsonl is
+tick) and every 2 s regardless. The process table (libproc in process, ~2 ms;
+a ps fork only where libproc is unusable) every 5 s, and at once, at most once
+a second, when a sessions/*.json names a live pid it has not listed yet. The
+one fork, on its own slow phase: netstat 1 s. A listed session whose pid has
+died is dropped on the next tick (kill(pid, 0)), not at the next table. chime.jsonl is
 stat'ed every tick. Transcripts are read by a worker thread that
 remembers each file's byte offset: live sessions' files every 2 s, a stat
 sweep of every transcript every 5 min. A backlog over 64 MB (the first build,
@@ -100,7 +101,7 @@ null means "not measured / not knowable", never zero.
   t                 snapshot time
   feed              self-cost of this process
     pid, cpu_s (own user+sys CPU so far), child_cpu_s (CPU of its forks so
-    far), rss (own resident bytes, from the last ps), tick_ms (compute time
+    far), rss (own resident bytes, from the last process table), tick_ms (compute time
     of this snapshot), up_s, period_ms (--stream, --serve), subs (--serve)
   sys
     cpu, user, sys  whole-machine CPU % over the last tick (user includes nice)
@@ -119,8 +120,11 @@ null means "not measured / not knowable", never zero.
     batt            {pct, charging, ac, mins_left (null = no estimate),
                     state (pmset's word)} or null on a Mac with no battery;
                     read from the same IOKit source pmset prints
-    top_cpu         [[name, cpu%] x5]   from ps, refreshed every 5 s
+    top_cpu         [[name, cpu%] x5]   from the process table, refreshed every 5 s
     top_mem         [[name, rss_bytes] x5]
+                    The user's own processes: another user's (root's, the
+                    window server's) CPU and memory are readable only as root,
+                    so they are not ranked (kiln-sample.py, THE PROCESS TABLE).
   claude
     limits
       five_hour, seven_day:
@@ -1397,7 +1401,8 @@ class History:
 class Sys:
     # Measured 2026-11-04 (5 calls each): swap, disk free, memory, pressure, GPU
     # (IOKit) and disk I/O cost under 0.1 ms, so they run every tick (0 = always).
-    # net (1.3 ms CPU, 14 ms wall) and ps (2.5/28) fork, so they keep their own
+    # net (1.3 ms CPU, 14 ms wall) forks and the process table costs ~2 ms (libproc,
+    # 2026-11-27; it was a ps fork, 42 ms of child CPU), so they keep their own
     # slower phases whatever the stream period is. Battery (2026-11-05): no
     # longer pmset (6.3 ms child CPU, so it ran every 30 s and lagged 7-23 s);
     # IOKit in process, 0.03 ms, on powerd's change notification and every 2 s.
@@ -1504,9 +1509,10 @@ class Sys:
         if self._due("ps", now, force):
             self._ps(now, force)
 
-    # --serve sets this: the periodic ps runs on a thread, so the loop that pushes session
-    # changes never waits on the fork (measured 2026-11-27: 49 ms of wall time, 182 ms at
-    # background QoS). The table is replaced whole when it lands.
+    # --serve sets this: the periodic table is read on a thread, so the loop that pushes
+    # session changes never waits on it. That was for the ps fork (measured 2026-11-27: 49 ms
+    # of wall time, 182 ms at background QoS); libproc takes ~2 ms, but ps is still the
+    # fallback. The table is replaced whole when it lands.
     ps_async = False
 
     def _ps(self, now, force):
