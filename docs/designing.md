@@ -1,10 +1,12 @@
 # Writing a KilnWall design
 
-KilnWall shows one design folder as the desktop wallpaper. It runs the data feed
-(`feed/kiln-feed.py --stream`) as a child process and hands the page one JSON line every
-period. The user picks the period from **100 to 1000 ms in 100 ms steps** (global hotkeys
-⌃⌥= and ⌃⌥-, or the menu-bar item's Refresh menu). The period changes live: no reload, no
-restart.
+KilnWall shows one design folder as the desktop wallpaper. It reads the data feed
+(`feed/kiln-feed.py`: the shared `--serve` agent if one is installed, see
+[shared-feed.md](shared-feed.md), else its own `--stream` child) and hands the page one JSON
+line every period. The user picks the period from **100 to 1000 ms in 100 ms steps** (global
+hotkeys ⌃⌥= and ⌃⌥-, or the menu-bar item's Refresh menu). The period changes live: no
+reload, no restart. On the shared feed a line can also arrive between periods, the moment a
+Claude session changes state, so never assume lines are evenly spaced.
 
 This guide is the contract a design has to meet: the folder layout, the `Kiln` runtime API,
 the feed schema, the performance budget and the dev tools.
@@ -157,7 +159,8 @@ unchanged block keeps its object identity between lines: `if (s.github === prev?
 is a free skip.
 
 - `t`, `v`
-- `feed{pid, period_ms, tick_ms, cpu_s, child_cpu_s, rss, up_s}`: the feed's own cost.
+- `feed{pid, period_ms, tick_ms, cpu_s, child_cpu_s, rss, up_s}`: the feed's own cost. On
+  the shared feed also `subs` (apps subscribed), and the cost is the one process's, shared.
 - `sys{cpu, user, sys, cores[10], load[3], gpu, gpu_detail{renderer, tiler, vram_used,
   vram_alloc}, mem{total, used, app, wired, active, compressed, cached, free, pressure:
   normal|warn|critical}, swap, net{rx_bps, tx_bps}, disk{free, total, read_bps, write_bps},

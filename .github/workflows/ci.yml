@@ -39,6 +39,11 @@ jobs:
         run: ./build.sh
       - name: the bundle has an executable
         run: test -x build/KilnWall.app/Contents/MacOS/KilnWall
+      # The shared feed's protocol (kiln-feed.py --serve) against real subscribers in a scratch
+      # HOME, with the python the app runs. macOS: the feed samples the machine through Mach/IOKit.
+      - name: shared feed protocol
+        timeout-minutes: 5
+        run: /usr/bin/python3 -W ignore::ResourceWarning tests/feed_serve_test.py
 
   # Every look replays the synthetic fixture in headless Chromium with zero page or console errors.
   designs:

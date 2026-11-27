@@ -3,6 +3,9 @@
 
     kiln-feed.py --once [--pretty]     one JSON snapshot on stdout (~1.1 s)
     kiln-feed.py --stream [--hz 1]     one JSON object per line, flushed, forever
+    kiln-feed.py --serve               the same lines to any number of subscribers on
+                                       a unix socket (see SHARED FEED)
+    kiln-feed.py --status              who is subscribed to a running --serve
     kiln-feed.py --analytics [--pretty]  refresh the 14-day analytics, print that block
 
 Data layer only; the dashboards (terminal, wallpaper) render it. Stdlib only.
@@ -57,6 +60,39 @@ most of it the analytics block. First analytics build: 663 files, 4.5 GB,
 shows there before it shows here.
 
 ────────────────────────────────────────────────────────────────────────────
+SHARED FEED  (--serve)
+One process serves every app that reads this feed, so they all see the same
+session state at the same instant, and the work is done once. It listens on
+$KILN_FEED_SOCK, default ~/Library/Application Support/kiln-feed/feed.sock
+(0600, in a 0700 folder whose flock it holds: a second --serve exits at once;
+a socket left by a crash is replaced; the socket is removed on exit). It is
+meant to run as a per-user LaunchAgent (scripts/install-agent.sh), and an app
+that finds no socket runs its own --stream child as before.
+  A subscriber connects and writes text commands, one per line:
+    hello <name>        a label for --status
+    want <blocks>       comma or space separated, from sys weather github claude
+                        analytics hist, or `all`, or `none`. Nothing is sent
+                        before the first want. A change sends a whole line at once.
+    period <ms>         its line period, 100..1000 (default 1000)
+    status              one {"status": {...}} line back (what --status prints)
+  It reads the same JSON lines as --stream, holding only the blocks it wants,
+  with the same sticky rule kept per subscriber (a block is left out of a line
+  when it has not changed since the last line THAT subscriber got), plus
+  feed.subs (subscribers now). The claude block is computed whenever anyone is
+  subscribed. Each other block is computed only while some subscriber wants it:
+  weather and GitHub are not polled, analytics is not derived, and the machine
+  is not sampled (but for ps, which tells live sessions) unless asked for.
+  Lines go out on each subscriber's period AND, between periods, the moment a
+  session changes: kqueue watches ~/.claude/sessions and each session's json,
+  the cache folder (ask-chime locks), chime.jsonl, each live main transcript
+  and each claude pid's exit. A change is read after EVENT_SETTLE_S and pushed
+  only if a session's state, name, ask or agent count, or the newest event,
+  moved (at most every EVENT_GAP_S); a reply streaming into a transcript moves
+  none of them. With no subscriber it does nothing but keep the transcript
+  index warm. A subscriber still reading its last line has the next one
+  dropped, and gets every sticky block again in the line after.
+
+────────────────────────────────────────────────────────────────────────────
 SNAPSHOT SCHEMA  (v 1). Times are epoch seconds; sizes are bytes; pct is 0-100.
 null means "not measured / not knowable", never zero.
 
@@ -65,7 +101,7 @@ null means "not measured / not knowable", never zero.
   feed              self-cost of this process
     pid, cpu_s (own user+sys CPU so far), child_cpu_s (CPU of its forks so
     far), rss (own resident bytes, from the last ps), tick_ms (compute time
-    of this snapshot), up_s
+    of this snapshot), up_s, period_ms (--stream, --serve), subs (--serve)
   sys
     cpu, user, sys  whole-machine CPU % over the last tick (user includes nice)
     cores           [% per core], same interval (>= ~1 s baseline)
@@ -286,6 +322,7 @@ import re
 import resource
 import select
 import signal
+import socket
 import stat
 import sys
 import threading
@@ -313,6 +350,10 @@ try:
     CTX_WINDOW = int(os.environ.get("KILN_CTX_WINDOW") or 1000000)
 except ValueError:
     CTX_WINDOW = 1000000
+
+# A line's top-level blocks besides v, t and feed. --serve computes and sends only
+# those a subscriber asked for (`want`); --once and --stream send them all.
+BLOCKS = ("sys", "weather", "github", "claude", "analytics", "hist")
 
 DAYS = 14
 SIDEV_S = 1000.0    # per-response output kept this long (out_15m needs 900 s)
@@ -440,6 +481,10 @@ class Ledger:
         self.stop = False
         self.child = None
         self.hot_s = HOT_S             # --stream sets this to its period
+        # --serve also reads a live transcript on the main thread the moment kqueue
+        # says it grew, so one file is read by one thread at a time (_scan).
+        self.rd = threading.Lock()
+        self.kick = threading.Event()  # wakes the worker: stop, or a period change
 
     @staticmethod
     def _empty():
@@ -721,15 +766,26 @@ class Ledger:
             except OSError:
                 continue
             rec = files.get(p)
-            if rec is None:
-                if st.st_mtime < cut:
-                    continue
-                rec = self._newrec(p)
-                with self.lk:
-                    files[p] = rec
-            elif st.st_size == rec["off"]:
+            if rec is not None and st.st_size == rec["off"]:
                 continue
-            self._read(p, rec, st, cut, dates)
+            # Under the reader lock, and stat'ed again inside it: another thread may
+            # have read this file meanwhile, and a size below the new offset would
+            # read as a truncation (and count the file twice).
+            with self.rd:
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                rec = files.get(p)
+                if rec is None:
+                    if st.st_mtime < cut:
+                        continue
+                    rec = self._newrec(p)
+                    with self.lk:
+                        files[p] = rec
+                elif st.st_size == rec["off"]:
+                    continue
+                self._read(p, rec, st, cut, dates)
 
     HOT_FULL_S, WARM_S = 5.0, 60.0
 
@@ -818,9 +874,14 @@ class Ledger:
             return
         seen = set(paths)
         _, cut = window_dates()
-        with self.lk:
+        # Under the reader lock: a file mid-read (--serve reads on the main thread too)
+        # has mt 0 until its read ends. Dropped: files gone from disk, or older than the
+        # window. One created since this sweep's glob (a new session) is kept; dropping
+        # it would read it again from offset 0 and count it twice.
+        with self.rd, self.lk:
             files = self.st["files"]
-            for p in [p for p, r in files.items() if p not in seen or r.get("mt", 0) < cut]:
+            for p in [p for p, r in files.items()
+                      if (p not in seen and not os.path.exists(p)) or r.get("mt", 0) < cut]:
                 del files[p]
             self._prune()
             self.st["swept_at"] = self.st["built_at"] = time.time()
@@ -873,12 +934,10 @@ class Ledger:
                     self.save()
             except Exception as e:                   # never let the feed die
                 sys.stderr.write("kiln-feed: ledger: %r\n" % (e,))
-            # Re-read each pass, so a period change takes effect within one wait.
-            end = time.monotonic() + max(0.1, self.hot_s)
-            while time.monotonic() < end:
-                if self.stop:
-                    return
-                time.sleep(min(0.05, max(0.0, end - time.monotonic())))
+            # Re-read each pass, so a period change takes effect within one wait. One
+            # blocking wait (stop and a new period set `kick`), not a 50 ms sleep loop.
+            if self.kick.wait(max(0.1, self.hot_s)):
+                self.kick.clear()
 
     # -- views (cheap; called under the lock) -------------------------------
 
@@ -1367,6 +1426,7 @@ class Sys:
         self.batt = None
         self.procs = []
         self.ps_at = 0.0
+        self.machine_at = 0.0      # last tick that sampled the machine (rates are differences)
 
     def _due(self, name, now, force):
         if force or now - self.last.get(name, -1e18) >= self.PHASES[name]:
@@ -1374,8 +1434,15 @@ class Sys:
             return True
         return False
 
-    def tick(self, force=False):
+    def tick(self, force=False, machine=True):
+        """machine=False (--serve with no subscriber that draws the machine): only
+        the ps phase, which the claude block needs to tell live sessions."""
         now = time.time()
+        if not machine:
+            if self._due("ps", now, force):
+                self._ps(now, force)
+            return
+        self.machine_at = now
         mono = time.monotonic()
         t = S.cpu_ticks()
         if t and self.prev:
@@ -1435,8 +1502,29 @@ class Sys:
         if self._due("batt", now, force or S.battery_changed()):
             self.batt = S.battery_fast()
         if self._due("ps", now, force):
+            self._ps(now, force)
+
+    # --serve sets this: the periodic ps runs on a thread, so the loop that pushes session
+    # changes never waits on the fork (measured 2026-11-27: 49 ms of wall time, 182 ms at
+    # background QoS). The table is replaced whole when it lands.
+    ps_async = False
+
+    def _ps(self, now, force):
+        if not self.ps_async or force:
             self.procs = S.process_table()
             self.ps_at = now
+            return
+        if getattr(self, "_ps_busy", False):
+            return
+        self._ps_busy = True
+
+        def run():
+            try:
+                rows = S.process_table()
+                self.procs, self.ps_at = rows, time.time()
+            finally:
+                self._ps_busy = False
+        threading.Thread(target=run, daemon=True).start()
 
     def ps_now(self):
         """Run ps out of phase (a session just started), at most once per
@@ -2258,10 +2346,9 @@ class Feed:
             return True
         return False
 
-    def snapshot(self, force=False):
-        c0 = time.perf_counter()
-        now = time.time()
-        self.sys.tick(force)
+    def claude(self, now, force=False):
+        """The claude block alone: what --serve recomputes when a session's files
+        change, between periods."""
         # Every tick: poll() is one stat while the file has not grown. At 2 s
         # an ask/done event reached the page up to 1.4 s after it was logged.
         self.chime.poll()
@@ -2270,7 +2357,23 @@ class Feed:
             self.ledger.st["names"].update(self.names)
         if force or self._every("limits", 1.0, now) or "limits" not in self.cache:
             self.cache["limits"] = self.limits(now)
-        if force or self._every("analytics", 10.0, now) or "analytics" not in self.cache:
+        return {"limits": self.cache["limits"], "sessions": sess,
+                "sessions_other": other, "agents_running": agents,
+                "tokens": self.ledger.tokens(now), "events": self.events()}
+
+    def snapshot(self, force=False, want=None, claude=None):
+        """Every block (want None: --once, --stream), or only the blocks in `want`
+        (--serve: the union of what the subscribers due now asked for). The claude
+        block is always computed; `claude` passes one computed already."""
+        c0 = time.perf_counter()
+        now = time.time()
+        want = BLOCKS if want is None else want
+        machine = "sys" in want or "hist" in want
+        self.sys.tick(force, machine=machine)
+        if claude is None:
+            claude = self.claude(now, force)
+        if "analytics" in want and (force or self._every("analytics", 10.0, now)
+                                    or "analytics" not in self.cache):
             self.cache["analytics"] = self.ledger.analytics(now, self.chime.fails)
         ru = resource.getrusage(resource.RUSAGE_SELF)
         rc = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -2281,16 +2384,22 @@ class Feed:
                      "child_cpu_s": round(rc.ru_utime + rc.ru_stime, 3),
                      "rss": me[4] if me else None, "up_s": round(now - self.t0, 1),
                      "tick_ms": None},
-            "sys": self.sys.block(),
-            # --once waits for a fetch only when there is no cached reading at all.
-            "weather": self.weather.get(now, wait=force and self.weather.data is None),
-            "github": self.github.get(now, wait=force),
-            "claude": {"limits": self.cache["limits"], "sessions": sess,
-                       "sessions_other": other, "agents_running": agents,
-                       "tokens": self.ledger.tokens(now), "events": self.events()},
-            "analytics": self.cache["analytics"],
         }
-        self._history(snap, now)
+        if machine:
+            snap["sys"] = self.sys.block()
+        if "weather" in want:
+            # --once waits for a fetch only when there is no cached reading at all.
+            snap["weather"] = self.weather.get(now, wait=force and self.weather.data is None)
+        if "github" in want:
+            snap["github"] = self.github.get(now, wait=force)
+        if "claude" in want:
+            snap["claude"] = claude
+        if "analytics" in want:
+            snap["analytics"] = self.cache["analytics"]
+        if "hist" in want:
+            self._history(snap, now)
+        if machine and "sys" not in want:
+            del snap["sys"]
         snap["feed"]["tick_ms"] = round((time.perf_counter() - c0) * 1000, 2)
         return snap
 
@@ -2352,7 +2461,7 @@ class Feed:
             self.cache["hist"] = h
             self.last["hist_save"] = now
         s = snap["sys"]
-        sess = snap["claude"]["sessions"]
+        sess = (snap.get("claude") or {}).get("sessions") or ()
         row = {"t": round(now, 1), "cpu": s["cpu"], "gpu": s["gpu"], "mem": s["mem"]["used"],
                "rx": s["net"]["rx_bps"], "tx": s["net"]["tx_bps"],
                "rd": s["disk"]["read_bps"], "wr": s["disk"]["write_bps"], "cores": s["cores"],
@@ -2372,6 +2481,7 @@ class Feed:
 
     def shutdown(self):
         self.ledger.stop = True
+        self.ledger.kick.set()
         ch = self.ledger.child
         if ch is not None and ch.poll() is None:
             ch.terminate()                # leave nothing running
@@ -2561,10 +2671,555 @@ def run_stream(period_ms):
             pass
 
 
+# ── --serve: one feed, any number of subscribers (see SHARED FEED) ─────────────
+
+SOCK_PATH = os.path.expanduser(os.environ.get("KILN_FEED_SOCK") or os.path.join(
+    HOME, "Library", "Application Support", "kiln-feed", "feed.sock"))
+SERVE_STICKY = (("analytics",), ("github",)) + STICKY
+EVENT_SETTLE_S = 0.01     # files written together (a lock and its chime line) land first
+EVENT_GAP_S = 0.05        # at most 20 pushes a second between periods
+MACHINE_COLD_S = 3.0      # machine rates older than this are re-based before they are sent
+O_EVTONLY = getattr(os, "O_EVTONLY", 0x8000)
+# The settle is a kqueue timer marked NOTE_CRITICAL | NOTE_USECONDS: the LaunchAgent can be
+# installed at background QoS (KILN_FEED_PROCESS_TYPE=Background), whose ordinary timeouts the kernel coalesces by up to ~200 ms
+# (measured: a push's p90 went from 45 ms to 198 ms under `taskpolicy -b`).
+_TIMER_FLAGS = 0x20 | 0x2
+
+
+def _at(path, op):
+    """bind or connect a unix socket path. sun_path holds 104 bytes, so a longer
+    path (a deep $HOME, a test folder) is used by its name from inside its folder."""
+    if len(os.fsencode(path)) < 100:
+        return op(path)
+    cwd = os.open(".", os.O_RDONLY)
+    try:
+        os.chdir(os.path.dirname(path))
+        return op(os.path.basename(path))
+    finally:
+        os.fchdir(cwd)
+        os.close(cwd)
+
+
+class _Sub:
+    """One subscriber: what it asked for, and what it was last sent."""
+
+    def __init__(self, sock):
+        self.sock, self.fd = sock, sock.fileno()
+        self.name = "?"
+        self.want = set()        # empty until its first `want`: nothing is sent before
+        self.period = 1.0
+        self.due = 0.0           # monotonic time its next periodic line is due
+        self.sticky = {}         # block path -> the encoding it was last sent
+        self.sig = None          # the session signature it was last sent (_sig)
+        self.hist_t = None       # the newest hist sample it was last sent
+        self.out = b""           # what is left of the line going out
+        self.inb = b""
+        self.lines = self.skipped = 0
+        self.since = time.time()
+
+
+def _sig(claude):
+    """A session change, as far as a push between periods is concerned: a state,
+    name, ask or agent count moved, or a new event was logged."""
+    return json.dumps([[s["sid"], s["name"], s["state"], s["since"], s["kind"], s["ask"],
+                        s["agents_running"]] for s in claude["sessions"]]
+                      + [claude["events"][-1:]], sort_keys=True, separators=(",", ":"))
+
+
+class Serve:
+    """kiln-feed.py --serve: one Feed for every subscriber on SOCK_PATH."""
+
+    def __init__(self, path=SOCK_PATH):
+        self.path = path
+        self.dir = os.path.dirname(path)
+        self.kq = select.kqueue()
+        self.f = None
+        self.lsock = self.lockfd = self.ino = None
+        self.subs = {}               # fd -> _Sub
+        self.watch, self.wpath = {}, {}   # fd -> (path, kind), path -> fd
+        self.pids = set()            # live sessions' pids, watched for exit
+        self.sids = ()
+        self.locksig = None
+        self.memo = {}               # block path -> (object, encoding)
+        self.ev_due = None
+        self.ev_last = -1e9
+        self.idle = True
+        self.pushes = 0
+
+    # -- the socket ------------------------------------------------------------
+
+    def open(self):
+        """Bind the socket (0600, in a 0700 folder). False if another --serve has it:
+        the folder's flock is held for the server's life."""
+        os.makedirs(self.dir, mode=0o700, exist_ok=True)
+        os.chmod(self.dir, 0o700)
+        self.lockfd = os.open(self.dir, os.O_RDONLY)
+        try:
+            fcntl.flock(self.lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(self.lockfd)
+            self.lockfd = None
+            return False
+        try:
+            os.unlink(self.path)         # holding the lock, a socket here is a dead server's
+        except FileNotFoundError:
+            pass
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        old = os.umask(0o077)
+        try:
+            _at(self.path, s.bind)
+        finally:
+            os.umask(old)
+        os.chmod(self.path, 0o600)
+        s.listen(16)
+        s.setblocking(False)
+        self.lsock = s
+        self.ino = os.stat(self.path).st_ino
+        self._kev(s.fileno(), select.KQ_FILTER_READ, select.KQ_EV_ADD)
+        return True
+
+    def close(self):
+        for s in list(self.subs.values()):
+            self._drop(s)
+        if self.lsock is not None:
+            self.lsock.close()
+            self.lsock = None
+            try:
+                if os.stat(self.path).st_ino == self.ino:   # ours, not a newer server's
+                    os.unlink(self.path)
+            except OSError:
+                pass
+        for fd in list(self.watch):
+            self._unwatch(fd)
+        if self.lockfd is not None:
+            os.close(self.lockfd)
+            self.lockfd = None
+
+    def _kev(self, ident, filt, flags, fflags=0):
+        try:
+            self.kq.control([select.kevent(ident, filt, flags, fflags)], 0)
+            return True
+        except OSError:
+            return False
+
+    def _accept(self):
+        while True:
+            try:
+                c, _ = self.lsock.accept()
+            except OSError:              # EAGAIN: none left
+                return
+            c.setblocking(False)
+            try:
+                c.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 16)   # a whole line
+            except OSError:
+                pass
+            s = _Sub(c)
+            self.subs[s.fd] = s
+            self._kev(s.fd, select.KQ_FILTER_READ, select.KQ_EV_ADD)
+
+    def _drop(self, s):
+        self.subs.pop(s.fd, None)
+        try:
+            s.sock.close()               # its kevents go with the descriptor
+        except OSError:
+            pass
+
+    def _readable(self, s, now):
+        try:
+            data = s.sock.recv(4096)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            data = b""
+        if not data:
+            self._drop(s)
+            return
+        s.inb += data
+        while b"\n" in s.inb:
+            ln, s.inb = s.inb.split(b"\n", 1)
+            self._command(s, ln.decode("utf-8", "replace").split(), now)
+        s.inb = s.inb[-256:]
+
+    def _command(self, s, parts, now):
+        if not parts:
+            return
+        cmd, args = parts[0], parts[1:]
+        if cmd == "hello" and args:
+            s.name = args[0][:40]
+        elif cmd == "period" and args:
+            try:
+                s.period = _period_ms(args[0]) / 1000.0
+            except ValueError:
+                return
+            s.due = min(s.due, now + s.period)
+        elif cmd == "want":
+            want = set()
+            for a in args:
+                for b in a.split(","):
+                    want |= set(BLOCKS) if b == "all" else {b} & set(BLOCKS)
+            if want == s.want:
+                return
+            s.want, s.sticky, s.sig, s.hist_t = want, {}, None, None
+            s.due = now                  # a whole line at once
+            if want & {"sys", "hist"} and time.time() - self.f.sys.machine_at > MACHINE_COLD_S:
+                # Machine rates are differences: base them now and send a moment later,
+                # as --stream's first line waits, rather than a rate over the whole gap.
+                self.f.sys.tick(machine=True)
+                s.due = now + min(s.period, 0.5)
+        elif cmd == "status":
+            self._queue(s, (json.dumps({"status": self.status()}, separators=(",", ":"))
+                            + "\n").encode())
+
+    def _queue(self, s, data):
+        if s.out:
+            return False
+        s.out = data
+        self._flush(s)
+        return True
+
+    def _flush(self, s):
+        try:
+            n = s.sock.send(s.out)
+        except (BlockingIOError, InterruptedError):
+            n = 0
+        except OSError:                  # the subscriber went away
+            self._drop(s)
+            return
+        s.out = s.out[n:]
+        if s.out:
+            self._kev(s.fd, select.KQ_FILTER_WRITE, select.KQ_EV_ADD | select.KQ_EV_ONESHOT)
+
+    def status(self):
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        rc = resource.getrusage(resource.RUSAGE_CHILDREN)
+        return {"pid": os.getpid(), "socket": self.path,
+                "up_s": round(time.time() - self.f.t0, 1),
+                "cpu_s": round(ru.ru_utime + ru.ru_stime, 3),
+                "child_cpu_s": round(rc.ru_utime + rc.ru_stime, 3),
+                "pushes": self.pushes,
+                # When the costly parts last ran: they run only while someone wants them.
+                "machine_at": round(self.f.sys.machine_at, 1) or None,
+                "analytics_at": round(self.f.last["analytics"], 1) if "analytics" in self.f.last else None,
+                "watching": {"files": len(self.watch), "pids": len(self.pids)},
+                "subs": [{"name": s.name, "want": sorted(s.want),
+                          "period_ms": round(s.period * 1000), "lines": s.lines,
+                          "skipped": s.skipped, "since": round(s.since, 1)}
+                         for s in self.subs.values() if s.want]}
+
+    # -- what is watched -------------------------------------------------------
+
+    def _watch(self, p, kind):
+        try:
+            fd = os.open(p, O_EVTONLY)
+        except OSError:
+            return
+        flags = (select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_DELETE
+                 | select.KQ_NOTE_RENAME)
+        if self._kev(fd, select.KQ_FILTER_VNODE, select.KQ_EV_ADD | select.KQ_EV_CLEAR, flags):
+            self.watch[fd] = (p, kind)
+            self.wpath[p] = fd
+        else:
+            os.close(fd)
+
+    def _unwatch(self, fd):
+        p, _ = self.watch.pop(fd, (None, None))
+        self.wpath.pop(p, None)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def _sync(self, claude):
+        """Watch what the live sessions' state is read from: the sessions folder and
+        each session's json, the cache folder (ask-chime locks come and go there),
+        chime.jsonl, each main transcript, and each claude pid for its exit."""
+        want = {SESS: "ctl", CACHE: "cache", CHIME_LOG: "ctl"}
+        pids, sids = set(), []
+        for s in claude["sessions"]:
+            sids.append(s["sid"])
+            if isinstance(s.get("pid"), int):
+                pids.add(s["pid"])
+                want[os.path.join(SESS, "%d.json" % s["pid"])] = "ctl"
+            mp = self.f.mains.get(s["sid"])
+            if mp:
+                want[mp] = "tr"
+        self.sids = tuple(sids)
+        for p in [p for p in self.wpath if p not in want]:
+            self._unwatch(self.wpath[p])
+        for p, kind in want.items():
+            if p not in self.wpath:
+                self._watch(p, kind)
+        for pid in pids - self.pids:
+            # One that exited since the claude block was computed cannot be watched;
+            # the next tick drops it (alive() fails).
+            if self._kev(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                         select.KQ_NOTE_EXIT):
+                self.pids.add(pid)
+        for pid in self.pids - pids:
+            self._kev(pid, select.KQ_FILTER_PROC, select.KQ_EV_DELETE)
+            self.pids.discard(pid)
+
+    def _locks_moved(self):
+        """The cache folder changed. The statusline rewrites files there several
+        times a second, so this asks only: did a live session's ask-chime lock come,
+        go or change, or chime.jsonl appear? One stat per live session."""
+        sig = []
+        for sid in self.sids:
+            try:
+                sig.append(os.stat(os.path.join(CACHE, "ask-chime-%s.json" % sid)).st_mtime)
+            except OSError:
+                sig.append(None)
+        sig = tuple(sig)
+        moved = sig != self.locksig
+        self.locksig = sig
+        return moved or (CHIME_LOG not in self.wpath and os.path.exists(CHIME_LOG))
+
+    def _turns_moved(self, paths):
+        """Main transcripts grew: read the new lines now (the worker would within a
+        period) and say whether a turn opened or closed or the title changed. A
+        streaming reply grows the file many times a second and changes none of it."""
+        L, stops = self.f.ledger, self.f.chime.last_stop
+
+        def key(p):
+            # Open as _state reads it: a chime.jsonl stop closes a turn as well as the
+            # transcript's own turn-end entry does (a turn closed only by the chime
+            # left this key "open", and the next prompt waited for the period).
+            r = L.main_rec(p) or {}
+            ls = stops.get(r.get("sid"))
+            te = max(r.get("te", 0), ls["ts"] if ls else 0)
+            return (r.get("ta", 0) > te + 0.5, r.get("ct"), r.get("ai"))
+        before = {p: key(p) for p in paths}
+        L._scan(sorted(paths))
+        return any(key(p) != before[p] for p in paths)
+
+    # -- lines -----------------------------------------------------------------
+
+    def _enc(self, path, obj):
+        m = self.memo.get(path)
+        if m is not None and m[0] is obj:    # the same block object: unchanged
+            return m[1]
+        e = json.dumps(obj, sort_keys=True, separators=(",", ":"))
+        self.memo[path] = (obj, e)
+        return e
+
+    def _send(self, s, snap, sig, nsubs):
+        if s.out:
+            # The last line is still going out (a busy reader): this one is dropped,
+            # so the next carries every sticky block again.
+            s.sticky = {}
+            s.skipped += 1
+            return
+        line = {"v": 1, "t": snap["t"],
+                "feed": dict(snap["feed"], period_ms=round(s.period * 1000), subs=nsubs)}
+        for b in BLOCKS:
+            if b in s.want and b in snap and b != "hist":
+                line[b] = snap[b]
+        if "claude" in line:
+            line["claude"] = dict(line["claude"])
+        h = self.f.cache.get("hist") if "hist" in s.want else None
+        if h and h["t"] and h["t"][-1] != s.hist_t:
+            line["hist"] = h             # only when a new sample landed, as --stream does
+            s.hist_t = h["t"][-1]
+        for path in SERVE_STICKY:
+            parent = line
+            for k in path[:-1]:
+                parent = parent.get(k) or {}
+            if path[-1] not in parent:
+                continue
+            e = self._enc(path, parent[path[-1]])
+            if s.sticky.get(path) == e:
+                del parent[path[-1]]
+            else:
+                s.sticky[path] = e
+        if "claude" in s.want:
+            s.sig = sig
+        s.lines += 1
+        self._queue(s, (json.dumps(line, separators=(",", ":")) + "\n").encode())
+
+    def _emit(self, subs, now, claude=None, sig=None):
+        want = set().union(*(s.want for s in subs)) | {"claude"}
+        snap = self.f.snapshot(want=want, claude=claude)
+        if claude is None:
+            self._sync(snap["claude"])
+            sig = _sig(snap["claude"])
+        nsubs = sum(1 for s in self.subs.values() if s.want)
+        for s in subs:
+            self._send(s, snap, sig, nsubs)
+            s.due = now + s.period
+
+    def _arm(self, now):
+        """A push after EVENT_SETTLE_S (and EVENT_GAP_S since the last), unless one is
+        armed. The critical timer wakes run() on time; ev_due is the fallback timeout."""
+        if self.ev_due is not None:
+            return
+        self.ev_due = max(now + EVENT_SETTLE_S, self.ev_last + EVENT_GAP_S)
+        us = max(1, int((self.ev_due - now) * 1e6))
+        try:
+            self.kq.control([select.kevent(0, select.KQ_FILTER_TIMER,
+                                           select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                           _TIMER_FLAGS, us)], 0)
+        except OSError:
+            pass                         # the timeout in run() still fires, maybe late
+
+    def _push(self, now):
+        """Between periods: the claude block now, and a line to each subscriber
+        whose sessions it changes."""
+        self.ev_due = None
+        self.ev_last = now
+        subs = [s for s in self.subs.values() if "claude" in s.want]
+        if not subs:
+            return
+        claude = self.f.claude(time.time())
+        self._sync(claude)
+        sig = _sig(claude)
+        targets = [s for s in subs if s.sig != sig]
+        if targets:
+            self.pushes += 1
+            self._emit(targets, now, claude, sig)
+
+    def _prime(self):
+        """The first subscriber after none: the live list and its transcripts are
+        brought up to date first, so the first line does not carry stale states (a
+        client that compares lines would read the catch-up as changes)."""
+        f = self.f
+        f.sys.tick(machine=False)
+        f.sessions(time.time())
+        f.ledger._scan([mp for _, mp in f.ledger.live if mp])
+        f.ledger.kick.set()
+
+    def run(self):
+        f = self.f
+        lfd = self.lsock.fileno()
+        while True:
+            now = time.monotonic()
+            active = [s for s in self.subs.values() if s.want]
+            timeout = max(0.0, min(s.due for s in active) - now) if active else None
+            if self.ev_due is not None:
+                t = max(0.0, self.ev_due - now)
+                timeout = t if timeout is None else min(timeout, t)
+            evs = self.kq.control(None, 64, timeout)
+            now = time.monotonic()
+            ctl, cache, trs, fire = False, False, set(), False
+            for ev in evs:
+                fl = ev.filter
+                if fl == select.KQ_FILTER_TIMER:
+                    fire = True
+                elif fl == select.KQ_FILTER_READ:
+                    if ev.ident == lfd:
+                        self._accept()
+                    elif ev.ident in self.subs:
+                        self._readable(self.subs[ev.ident], now)
+                elif fl == select.KQ_FILTER_WRITE:
+                    s = self.subs.get(ev.ident)
+                    if s is not None and s.out:
+                        self._flush(s)
+                elif fl == select.KQ_FILTER_VNODE:
+                    p, kind = self.watch.get(ev.ident, (None, None))
+                    if p is None:
+                        continue
+                    if ev.fflags & (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME):
+                        self._unwatch(ev.ident)      # replaced: watched again by path
+                        ctl = True
+                    if kind == "ctl":
+                        ctl = True
+                    elif kind == "cache":
+                        cache = True
+                    elif kind == "tr":
+                        trs.add(p)
+                elif fl == select.KQ_FILTER_PROC:
+                    self.pids.discard(ev.ident)
+                    ctl = True
+            active = [s for s in self.subs.values() if s.want]
+            if not active:
+                # Nobody asking: no ticks, no pushes. The worker keeps the index warm.
+                if not self.idle:
+                    self.idle, self.ev_due = True, None
+                    f.ledger.hot_s = HOT_S
+                continue
+            if self.idle:
+                self.idle = False
+                self._prime()
+            hot = max(0.1, min(s.period for s in active))
+            if hot != f.ledger.hot_s:
+                f.ledger.hot_s = hot
+                f.ledger.kick.set()
+            if cache and self._locks_moved():
+                ctl = True
+            if trs and self._turns_moved(trs):
+                ctl = True
+            if ctl:
+                self._arm(now)
+            now = time.monotonic()
+            if self.ev_due is not None and (fire or now >= self.ev_due):
+                self._push(now)
+            due = [s for s in self.subs.values() if s.want and s.due <= now]
+            if due:
+                # Others due within 40% of their period go with this tick, so two
+                # subscribers settle into one phase instead of two ticks.
+                self._emit([s for s in self.subs.values()
+                            if s.want and s.due <= now + 0.4 * s.period], now)
+
+
+def run_serve():
+    """--serve: see SHARED FEED in the header."""
+    srv = Serve()
+    if not srv.open():
+        sys.stderr.write("kiln-feed: another --serve has %s; exiting\n" % srv.path)
+        return
+
+    def bye(*_):
+        raise _Stop()
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, bye)
+    f = None
+    try:
+        f = srv.f = Feed()
+        f.sys.ps_async = True
+        f.ledger.load()
+        f.chime.poll()
+        f.sys.tick(force=True)
+        srv._sync(f.claude(time.time()))
+        f.start_worker()
+        srv.run()
+    except _Stop:
+        pass
+    finally:
+        for step in (srv.close, f.shutdown if f else None):
+            try:
+                if step:
+                    step()
+            except _Stop:
+                pass
+
+
+def run_status():
+    """--status: ask a running --serve who is subscribed."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(3)
+    buf = b""
+    try:
+        _at(SOCK_PATH, s.connect)
+        s.sendall(b"status\n")
+        while b"\n" not in buf:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        st = json.loads(buf.split(b"\n")[0])["status"]
+    except (OSError, ValueError, KeyError) as e:
+        sys.stderr.write("kiln-feed: no --serve answering at %s (%s)\n" % (SOCK_PATH, e))
+        sys.exit(1)
+    print(json.dumps(st, indent=1))
+
+
 def main():
     a = sys.argv[1:]
     pretty = "--pretty" in a
-    if "--stream" in a:
+    if "--serve" in a:
+        run_serve()
+    elif "--status" in a:
+        run_status()
+    elif "--stream" in a:
         ms = 1000
         try:
             if "--period-ms" in a:
