@@ -29,6 +29,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
@@ -760,10 +761,67 @@ def _etime_s(s):
     return d * 86400 + p[0] * 3600 + p[1] * 60 + p[2]
 
 
+def _cputime_s(s):
+    """ps time `[[dd-]hh:]mm:ss.ss` (macOS prints minutes past 59: `369:31.09`) to seconds."""
+    d = 0.0
+    if "-" in s:
+        dd, s = s.split("-", 1)
+        d = int(dd) * 86400.0
+    t = 0.0
+    for x in s.split(":"):
+        t = t * 60 + float(x)
+    return d + t
+
+
+class Table(list):
+    """process_table()'s rows. `blind`: the pids whose CPU and memory could not be
+    read (another user's processes, unprivileged), whose rows carry cpu 0.0 and
+    rss 0. Empty for the ps table, which reads every process."""
+    blind = frozenset()
+
+
 def process_table():
-    """[(pid, ppid, etime_s, cpu%, rss_bytes, comm)] — one ps fork, ~28 ms of
-    child CPU. processes() plus parentage and age, which kiln-feed needs to
-    tell a live Claude session from a recycled pid and to see its children."""
+    """[(pid, ppid, etime_s, cpu%, rss_bytes, comm)], a Table: processes() plus
+    parentage and age, which kiln-feed needs to tell a live Claude session from a
+    recycled pid and to see its children. Read in process through libproc (see THE
+    PROCESS TABLE WITHOUT A FORK below); the ps fork only if that is unusable."""
+    try:
+        rows = _table_libproc()
+    except (OSError, ValueError, AttributeError, ctypes.ArgumentError):
+        rows = None
+    return rows if rows else Table(_table_ps())
+
+
+def ps_usage():
+    """{pid: (start_epoch, cpu_s, cpu%, rss_bytes)} for every process, from one
+    ps fork (42 ms of child CPU inside the shared feed). ps is setuid root, so this
+    reads what libproc cannot unprivileged: another user's CPU and memory. kiln-feed
+    runs it only while a subscriber draws top_cpu/top_mem, every 30 s. cpu_s is the
+    process's CPU time so far (ps `time`, to 10 ms), cpu% ps's own figure, the
+    scheduler's decaying average."""
+    try:
+        out = subprocess.run(["/bin/ps", "-axo", "pid=,etime=,time=,%cpu=,rss="],
+                             capture_output=True, text=True, timeout=4).stdout
+    except Exception:
+        return {}
+    now = time.time()
+    got = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) != 5:
+            continue
+        try:
+            got[int(f[0])] = (now - _etime_s(f[1]), _cputime_s(f[2]), float(f[3]),
+                              int(f[4]) * 1024)
+        except ValueError:
+            continue
+    return got
+
+
+def _table_ps():
+    """process_table() from one ps fork: 28 ms of child CPU from a shell, 42 ms
+    from inside the shared feed (measured 2026-11-27; the fork copies the feed's
+    Python before ps runs)."""
     try:
         out = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,etime=,%cpu=,rss=,comm="],
                              capture_output=True, text=True, timeout=4).stdout
@@ -780,6 +838,222 @@ def process_table():
         except ValueError:
             continue
     return rows
+
+
+# ── the process table without a fork (2026-11-27) ────────────────────────────
+# The shared feed read ps every 5 s: 12 forks a minute at 42 ms of child CPU
+# each, 0.85% of a core for the table alone. libproc answers the same questions
+# in process. What an unprivileged process can see (ps is setuid root; this is
+# not):
+#   - every pid (proc_listallpids) with its parent and short name
+#     (PROC_PIDT_SHORTBSDINFO);
+#   - the user's own processes in full (PROC_PIDTASKALLINFO: start time,
+#     resident size, user+system CPU time), and argv[0] (sysctl KERN_PROCARGS2),
+#     which is what ps prints as comm: "claude" and "-zsh", where the executable
+#     is a version-numbered file and /bin/zsh;
+#   - other users' processes (root, _windowserver, ...): pid, parent, start time
+#     (sysctl KERN_PROC_PID) and executable path (proc_pidpath), but NOT their
+#     CPU or memory, which the kernel gives only to the same user or to root.
+#     Their rows carry cpu 0.0 and rss 0, and their pids are the table's `blind`
+#     set. kiln-feed fills those two numbers from a slow ps (ps_usage(), every
+#     30 s) only while a subscriber draws top_cpu/top_mem; see Sys.rows() there.
+# cpu% is CPU time over the wall time since the previous table (a process seen
+# for the first time: over its life so far). ps prints the scheduler's decaying
+# average of the same thing; both read ~100 for a process spinning one core.
+# CPU times arrive in Mach units: mach_timebase_info (125/3 ns on Apple silicon).
+# Names are cached per process (pid, start time, short name), so a steady table
+# costs one libproc call per pid: 1.9 ms of CPU for 713 processes, against 42 ms
+# for the ps fork it replaces (13.5 ms on the first call, which reads every
+# name). pid 0 (kernel_task) is left out, as ps leaves it.
+
+class _ShortBSD(ctypes.Structure):
+    _fields_ = [("pid", ctypes.c_uint32), ("ppid", ctypes.c_uint32), ("pgid", ctypes.c_uint32),
+                ("status", ctypes.c_uint32), ("comm", ctypes.c_char * 16),
+                ("flags", ctypes.c_uint32), ("uid", ctypes.c_uint32), ("gid", ctypes.c_uint32),
+                ("ruid", ctypes.c_uint32), ("rgid", ctypes.c_uint32), ("svuid", ctypes.c_uint32),
+                ("svgid", ctypes.c_uint32), ("rfu", ctypes.c_uint32)]
+
+
+class _BSDInfo(ctypes.Structure):
+    _fields_ = [("flags", ctypes.c_uint32), ("status", ctypes.c_uint32),
+                ("xstatus", ctypes.c_uint32), ("pid", ctypes.c_uint32), ("ppid", ctypes.c_uint32),
+                ("uid", ctypes.c_uint32), ("gid", ctypes.c_uint32), ("ruid", ctypes.c_uint32),
+                ("rgid", ctypes.c_uint32), ("svuid", ctypes.c_uint32), ("svgid", ctypes.c_uint32),
+                ("rfu", ctypes.c_uint32), ("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32),
+                ("nfiles", ctypes.c_uint32), ("pgid", ctypes.c_uint32), ("pjobc", ctypes.c_uint32),
+                ("tdev", ctypes.c_uint32), ("tpgid", ctypes.c_uint32), ("nice", ctypes.c_int32),
+                ("start_s", ctypes.c_uint64), ("start_us", ctypes.c_uint64)]
+
+
+class _TaskInfo(ctypes.Structure):
+    _fields_ = [("vsize", ctypes.c_uint64), ("rss", ctypes.c_uint64),
+                ("user", ctypes.c_uint64), ("system", ctypes.c_uint64),
+                ("threads_user", ctypes.c_uint64), ("threads_system", ctypes.c_uint64)] + [
+        (n, ctypes.c_int32) for n in ("policy", "faults", "pageins", "cow_faults", "msgs_sent",
+                                      "msgs_received", "syscalls_mach", "syscalls_unix", "csw",
+                                      "threadnum", "numrunning", "priority")]
+
+
+class _TaskAllInfo(ctypes.Structure):
+    _fields_ = [("bsd", _BSDInfo), ("task", _TaskInfo)]
+
+
+_PIDTASKALLINFO, _PIDT_SHORTBSDINFO = 2, 13
+_CTL_KERN, _KERN_PROC, _KERN_PROC_PID, _KERN_PROCARGS2, _KERN_ARGMAX = 1, 14, 1, 49, 8
+_LP = {}            # libproc, timebase and buffers once loaded; {"ok": False} if unusable
+_LP_PREV = {}       # pid -> (start, cpu_ns, monotonic, cpu%) from the previous table
+_LP_NAME = {}       # pid -> (start, short name, comm, ppid if another user's else None)
+_LP_LOCK = threading.Lock()   # --serve reads it from a thread and from its loop
+
+
+def _lp_init():
+    if not _LP:
+        try:
+            lp = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            lp.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            lp.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                        ctypes.c_void_p, ctypes.c_int]
+            lp.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+            _libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                                     ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p,
+                                     ctypes.c_size_t]
+            tb = (ctypes.c_uint32 * 2)()
+            if _libc.mach_timebase_info(tb) != 0 or not tb[0] or not tb[1]:
+                raise OSError("mach_timebase_info")
+            amax = ctypes.c_int(0)
+            n = ctypes.c_size_t(ctypes.sizeof(amax))
+            mib = (ctypes.c_int * 2)(_CTL_KERN, _KERN_ARGMAX)
+            if _libc.sysctl(mib, 2, ctypes.byref(amax), ctypes.byref(n), None, 0) != 0:
+                amax.value = 1 << 20
+            _LP.update(ok=True, lp=lp, ns=tb[0] / tb[1], argmax=max(amax.value, 1 << 16),
+                       all=_TaskAllInfo(), short=_ShortBSD(),
+                       kp=ctypes.create_string_buffer(1024), args=ctypes.create_string_buffer(16384),
+                       path=ctypes.create_string_buffer(4096))
+        except (OSError, AttributeError):
+            _LP.clear()
+            _LP["ok"] = False
+    return _LP["ok"]
+
+
+def _argv0(pid):
+    """argv[0] of one of the user's own processes (ps's comm), or None."""
+    mib = (ctypes.c_int * 3)(_CTL_KERN, _KERN_PROCARGS2, pid)
+    buf = _LP["args"]
+    n = ctypes.c_size_t(len(buf))
+    if _libc.sysctl(mib, 3, buf, ctypes.byref(n), None, 0) != 0:
+        return None
+    if n.value >= len(buf):
+        # Too small: the kernel keeps argc and the END of the area, not argv[0].
+        buf = ctypes.create_string_buffer(_LP["argmax"])
+        n = ctypes.c_size_t(len(buf))
+        if _libc.sysctl(mib, 3, buf, ctypes.byref(n), None, 0) != 0:
+            return None
+    raw = ctypes.string_at(buf, n.value)
+    if len(raw) < 5 or int.from_bytes(raw[:4], "little") < 1:
+        return None
+    i = raw.find(b"\0", 4)                 # the executable path, then NUL padding
+    if i < 0:
+        return None
+    j = i
+    while j < len(raw) and raw[j] == 0:
+        j += 1
+    k = raw.find(b"\0", j)
+    a0 = raw[j:k] if k >= 0 else raw[j:]
+    return (a0 or raw[4:i]).decode("utf-8", "replace") or None
+
+
+def _pidpath(pid):
+    p = _LP["path"]
+    n = _LP["lp"].proc_pidpath(pid, p, len(p))
+    return p.raw[:n].decode("utf-8", "replace") if n > 0 else None
+
+
+def _start_of(pid):
+    """(sec, usec) a process started, from kinfo_proc (any user's), or None."""
+    mib = (ctypes.c_int * 4)(_CTL_KERN, _KERN_PROC, _KERN_PROC_PID, pid)
+    kp = _LP["kp"]
+    n = ctypes.c_size_t(len(kp))
+    if _libc.sysctl(mib, 4, kp, ctypes.byref(n), None, 0) != 0 or n.value < 16:
+        return None
+    # kinfo_proc opens with extern_proc's p_starttime: a timeval {long sec; int usec}.
+    return (ctypes.c_int64.from_buffer(kp, 0).value, ctypes.c_int32.from_buffer(kp, 8).value)
+
+
+def _table_libproc():
+    """process_table() through libproc, or None where libproc is unusable."""
+    if not _lp_init():
+        return None
+    lp = _LP["lp"]
+    ns = _LP["ns"]
+    a, s = _LP["all"], _LP["short"]
+    ra, rs = ctypes.byref(a), ctypes.byref(s)
+    size_a, size_s = ctypes.sizeof(a), ctypes.sizeof(s)
+    with _LP_LOCK:
+        n = lp.proc_listallpids(None, 0)
+        if n <= 0:
+            return None
+        pids = (ctypes.c_int * (n + 64))()
+        n = lp.proc_listallpids(pids, ctypes.sizeof(pids))
+        if n <= 0:
+            return None
+        now, mono = time.time(), time.monotonic()
+        prev, names = _LP_PREV.copy(), _LP_NAME.copy()
+        # Another user's process listed in the last table, under the same parent
+        # and short name, is the same process: its start time and path are kept
+        # rather than asked again (kinfo_proc is ~10 us a pid, most of a table's
+        # cost). Only while the tables are close together: pids are reused only
+        # after the pid space wraps, which takes hours.
+        recent = mono - _LP.get("at", -1e18) < 60.0
+        _LP["at"] = mono
+        _LP_PREV.clear()
+        _LP_NAME.clear()
+        rows, blind = Table(), set()
+        for pid in pids[:n]:
+            if pid <= 0:
+                continue
+            c = names.get(pid)
+            if recent and c and c[3] is not None:      # another user's, last time
+                if lp.proc_pidinfo(pid, _PIDT_SHORTBSDINFO, 0, rs, size_s) == size_s \
+                        and s.comm == c[1] and s.ppid == c[3]:
+                    _LP_NAME[pid] = c
+                    rows.append((pid, c[3], max(0, int(now - (c[0][0] + c[0][1] / 1e6))),
+                                 0.0, 0, c[2]))
+                    blind.add(pid)
+                    continue
+            if lp.proc_pidinfo(pid, _PIDTASKALLINFO, 0, ra, size_a) == size_a:
+                b, t = a.bsd, a.task
+                start = (b.start_s, b.start_us)
+                short = b.comm
+                comm = c[2] if c and c[0] == start and c[1] == short else (
+                    _argv0(pid) or _pidpath(pid) or (b.name or short).decode("utf-8", "replace"))
+                cpu_ns = (t.user + t.system) * ns
+                p = prev.get(pid)
+                if p and p[0] == start and mono - p[2] < 0.5:
+                    keep = p                               # too short a window to read
+                elif p and p[0] == start:
+                    keep = (start, cpu_ns, mono, max(0.0, 100.0 * (cpu_ns - p[1])
+                                                     / ((mono - p[2]) * 1e9)))
+                else:
+                    life = max(1.0, now - (start[0] + start[1] / 1e6))
+                    keep = (start, cpu_ns, mono, 100.0 * cpu_ns / (life * 1e9))
+                _LP_PREV[pid] = keep
+                ppid, rss, pct = b.ppid, t.rss, keep[3]
+                _LP_NAME[pid] = (start, short, comm, None)
+            elif lp.proc_pidinfo(pid, _PIDT_SHORTBSDINFO, 0, rs, size_s) == size_s:
+                start = _start_of(pid)
+                if start is None:
+                    continue                               # gone
+                short, ppid, rss, pct = s.comm, s.ppid, 0, 0.0
+                comm = c[2] if c and c[0] == start and c[1] == short else (
+                    _pidpath(pid) or short.decode("utf-8", "replace"))
+                _LP_NAME[pid] = (start, short, comm, ppid)
+                blind.add(pid)
+            else:
+                continue                                   # gone
+            rows.append((pid, ppid, max(0, int(now - (start[0] + start[1] / 1e6))),
+                         round(pct, 1), rss, comm))
+        rows.blind = frozenset(blind)
+        return rows
 
 
 _BATT_RE = re.compile(r"(\d+)%;\s*([^;]+);\s*([^\n]*)")
