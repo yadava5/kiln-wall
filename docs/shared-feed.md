@@ -82,24 +82,33 @@ settle is a `NOTE_CRITICAL` kqueue timer. Then, at background QoS, every state c
 in at a median of 14 to 17 ms and at most 20 ms (70 changes); a session start, which needs a
 fresh `ps`, at a median of 219 ms (10 starts, max 591 ms).
 
-**CPU and memory, steady state.** Real `HOME`, two live sessions, 60 s after a 15 s warm-up.
-CPU is each process's own and its forks' (`ps`, `netstat`), from its own `getrusage`.
+**Cost, steady state.** Real `HOME`, two live sessions, 60 s after a 15 s warm-up, before and
+after alternated, two rounds (both values shown). Each runs at the priority it really runs at:
+the old copies as the apps' children (normal QoS), the shared feed as the LaunchAgent runs it
+(background QoS, loaded as a module). Energy is the kernel's count for each feed process
+(`ri_energy_nj`, from `proc_pid_rusage`); it leaves out the `ps` and `netstat` forks, which are in
+the CPU column.
 
-| | processes | CPU (own + forks) | RSS |
-|---|---|---|---|
-| desktop visible, before: KilnWall's child (500 ms) + the notch app's copy | 2 | 4.28% (2.35 + 1.93) | 42.5 MB |
-| desktop visible, shared feed (all at 500 ms + claude at 1000 ms) | 1 | 1.97% (0.97 + 1.00) | 25.4 MB |
-| desktop covered, before: the notch app's copy only | 1 | 1.0 to 2.3% (3 runs) | 17.4 to 17.7 MB |
-| desktop covered, shared feed (claude at 1000 ms) | 1 | 0.9 to 2.3% (4 runs) | 17.7 to 19.4 MB |
+| | processes | energy (own) | CPU-seconds (own + forks) | RSS |
+|---|---|---|---|---|
+| desktop visible, before: KilnWall's child (500 ms) + the notch app's copy | 2 | 34.1, 16.7 mW | 2.6, 7.2% | 51.8, 51.9 MB |
+| desktop visible, shared feed (all at 500 ms + claude at 1000 ms) | 1 | 3.5, 3.8 mW | 7.3, 7.4% | 24.8, 24.4 MB |
+| desktop covered, before: the notch app's copy only | 1 | 10.0, 6.4 mW | 0.9, 1.7% | 17.3, 17.3 MB |
+| desktop covered, shared feed (claude at 1000 ms) | 1 | 1.9, 1.8 mW | 3.5, 4.2% | 17.8, 17.9 MB |
 
-With the desktop visible, the shared feed costs half the CPU and 40% less memory than the two
-copies. With it covered (most of a working day), KilnWall's child was already stopped, so one
-process ran before as now and the two cost the same within the noise: runs taken alternately,
-minutes apart, spread from 0.9 to 2.3%, mostly the `ps` fork's cost moving with the machine's
-load. What else goes: each return to the desktop past the 120 s grace used to start a new child,
-about 0.15 CPU-seconds and 0.6 s before its first line (measured three times); now KilnWall
-subscribes, and its first line comes at once, or 0.5 s later when machine rates need a fresh
-baseline.
+Energy falls 4 to 10 times with the desktop visible and 3 to 5 times with it covered; memory
+halves when both apps read. **CPU-seconds go up**, because background QoS keeps the agent on
+the efficiency cores (99% of its instructions there, against 89 to 100% on the performance
+cores at normal QoS). They run the same work at a lower clock, so it takes 3 to 4 times as long
+for far less energy. Same code, same subscription, alternated: 1.2 to 1.4% CPU and 10.4 to
+11.0 mW at normal QoS, 4.4 to 4.9% and 1.6 to 2.4 mW at background. At normal QoS the shared
+feed also takes fewer CPU-seconds than the two copies (visible, an earlier run: 4.28% to 1.97%),
+at 4 to 7 times the agent's energy. Background is the default for that reason; remove
+`ProcessType` from the plist to make the other trade.
+
+Also gone: each return to the desktop past the 120 s grace used to start a new child, about
+0.15 CPU-seconds and 0.6 s before its first line (measured three times). Now KilnWall subscribes,
+and its first line comes at once, or 0.5 s later when machine rates need a fresh baseline.
 
 ## Install
 
