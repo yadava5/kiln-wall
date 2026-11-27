@@ -281,12 +281,15 @@ class ServeTest(unittest.TestCase):
         s1 = status(self.home)
         self.assertEqual(s1["machine_at"], s0["machine_at"], "machine sampled for a claude-only subscriber")
         self.assertIsNone(s1["analytics_at"], "analytics derived for a claude-only subscriber")
+        self.assertIsNone(s1["fill_at"], "the slow ps ran for a claude-only subscriber")
+        self.assertEqual(s1["child_cpu_s"], s0["child_cpu_s"], "a fork for a claude-only subscriber")
         wall = self.client("want all\nperiod 200\n")
         wall.until(lambda d: "sys" in d)
         time.sleep(0.5)
         s2 = status(self.home)
         self.assertGreater(s2["machine_at"], s1["machine_at"])
         self.assertIsNotNone(s2["analytics_at"])
+        self.assertIsNotNone(s2["fill_at"], "no slow ps for a subscriber that draws top_cpu")
         wall.close()
         self.clients.remove(wall)
         time.sleep(0.5)
@@ -408,6 +411,85 @@ class ProcessTableTest(unittest.TestCase):
         finally:
             spin.kill()
             spin.wait()
+
+
+def feed_module():
+    """kiln-feed.py as a module (its main() is not run)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("kiln_feed_test", FEED)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+class FillTest(unittest.TestCase):
+    """Other users' rows: libproc cannot read their CPU or memory, so a slow ps fills them
+    in, and only while the sys block (top_cpu/top_mem) is wanted."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.F = feed_module()
+
+    def counting_ps(self):
+        """Patch subprocess.run in the sampler; returns the list of ps calls it sees."""
+        from unittest import mock
+        sub = self.F.S.subprocess
+        real, calls = sub.run, []
+
+        def run(argv, *a, **k):
+            if argv and argv[0] == "/bin/ps":
+                calls.append(argv)
+            return real(argv, *a, **k)
+        p = mock.patch.object(sub, "run", run)
+        p.start()
+        self.addCleanup(p.stop)
+        return calls
+
+    def test_no_ps_fork_unless_the_sys_block_is_wanted(self):
+        calls = self.counting_ps()
+        s = self.F.Sys()
+        for _ in range(3):
+            s.tick(force=True, machine=False)           # claude only
+            s.tick(force=True, machine=True)            # hist only: machine, no top lists
+            s.ps_now()
+            s.block()
+        self.assertTrue(s.procs.blind, "libproc read every row: nothing to fill (run unprivileged)")
+        self.assertEqual(calls, [], "ps forked with no subscriber drawing top_cpu/top_mem")
+        self.assertEqual(s.fill_at, 0.0)
+        s.tick(force=True, machine=True, top=True)
+        self.assertEqual(len(calls), 1, "the sys block wanted: one slow ps")
+        s.tick(machine=True, top=True)                  # within its 30 s phase: no other
+        self.assertEqual(len(calls), 1)
+
+    def test_other_users_rows_get_cpu_and_rss_from_the_fill(self):
+        s = self.F.Sys()
+        s.tick(force=True, machine=True, top=True)
+        raw = {p[0]: p for p in s.procs}
+        # launchd, pid 1, is root's: unreadable to libproc, filled from ps.
+        self.assertIn(1, s.procs.blind)
+        self.assertEqual(raw[1][3:5], (0.0, 0))
+        got = {p[0]: p for p in s.rows()}
+        self.assertGreater(got[1][4], 0, "pid 1's rss not filled in")
+        unfilled = [raw[p][5] for p in s.procs.blind if p in got and got[p][4] == 0]
+        self.assertLessEqual(len(unfilled), 3, unfilled[:5])      # gone between table and ps
+        # cpu%: the CPU-time delta between two fills, over the wall time between them.
+        cur = self.F.S.ps_usage()
+        st, cpu_s, _, rss = cur[1]
+        t = time.time()
+        s._fill_from({1: (st, cpu_s, 0.0, rss)}, t - 10.0)
+        s._fill_from({1: (st, cpu_s + 3.0, 77.0, rss)}, t)
+        self.assertAlmostEqual({p[0]: p for p in s.rows()}[1][3], 30.0, places=1)
+        # The first fill, or one too long after the last: ps's own %cpu.
+        s._fill_prev = None
+        s._fill_from({1: (st, cpu_s, 77.0, rss)}, t)
+        self.assertEqual({p[0]: p for p in s.rows()}[1][3], 77.0)
+        # A pid whose start time does not match (reused) keeps the table's zeros.
+        s._fill_from({1: (st - 100.0, cpu_s, 55.0, rss)}, t)
+        self.assertEqual({p[0]: p for p in s.rows()}[1][3:5], (0.0, 0))
+        # A fill older than FILL_MAX_S is not used.
+        s._fill_from({1: (st, cpu_s, 55.0, rss)}, t)
+        s.fill_at = time.time() - s.FILL_MAX_S - 1
+        self.assertEqual({p[0]: p for p in s.rows()}[1][3:5], (0.0, 0))
 
 
 if __name__ == "__main__":

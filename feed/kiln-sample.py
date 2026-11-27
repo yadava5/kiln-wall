@@ -761,16 +761,61 @@ def _etime_s(s):
     return d * 86400 + p[0] * 3600 + p[1] * 60 + p[2]
 
 
+def _cputime_s(s):
+    """ps time `[[dd-]hh:]mm:ss.ss` (macOS prints minutes past 59: `369:31.09`) to seconds."""
+    d = 0.0
+    if "-" in s:
+        dd, s = s.split("-", 1)
+        d = int(dd) * 86400.0
+    t = 0.0
+    for x in s.split(":"):
+        t = t * 60 + float(x)
+    return d + t
+
+
+class Table(list):
+    """process_table()'s rows. `blind`: the pids whose CPU and memory could not be
+    read (another user's processes, unprivileged), whose rows carry cpu 0.0 and
+    rss 0. Empty for the ps table, which reads every process."""
+    blind = frozenset()
+
+
 def process_table():
-    """[(pid, ppid, etime_s, cpu%, rss_bytes, comm)]: processes() plus parentage
-    and age, which kiln-feed needs to tell a live Claude session from a recycled
-    pid and to see its children. Read in process through libproc (see THE
+    """[(pid, ppid, etime_s, cpu%, rss_bytes, comm)], a Table: processes() plus
+    parentage and age, which kiln-feed needs to tell a live Claude session from a
+    recycled pid and to see its children. Read in process through libproc (see THE
     PROCESS TABLE WITHOUT A FORK below); the ps fork only if that is unusable."""
     try:
         rows = _table_libproc()
     except (OSError, ValueError, AttributeError, ctypes.ArgumentError):
         rows = None
-    return rows if rows else _table_ps()
+    return rows if rows else Table(_table_ps())
+
+
+def ps_usage():
+    """{pid: (start_epoch, cpu_s, cpu%, rss_bytes)} for every process, from one
+    ps fork (42 ms of child CPU inside the shared feed). ps is setuid root, so this
+    reads what libproc cannot unprivileged: another user's CPU and memory. kiln-feed
+    runs it only while a subscriber draws top_cpu/top_mem, every 30 s. cpu_s is the
+    process's CPU time so far (ps `time`, to 10 ms), cpu% ps's own figure, the
+    scheduler's decaying average."""
+    try:
+        out = subprocess.run(["/bin/ps", "-axo", "pid=,etime=,time=,%cpu=,rss="],
+                             capture_output=True, text=True, timeout=4).stdout
+    except Exception:
+        return {}
+    now = time.time()
+    got = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) != 5:
+            continue
+        try:
+            got[int(f[0])] = (now - _etime_s(f[1]), _cputime_s(f[2]), float(f[3]),
+                              int(f[4]) * 1024)
+        except ValueError:
+            continue
+    return got
 
 
 def _table_ps():
@@ -809,7 +854,9 @@ def _table_ps():
 #   - other users' processes (root, _windowserver, ...): pid, parent, start time
 #     (sysctl KERN_PROC_PID) and executable path (proc_pidpath), but NOT their
 #     CPU or memory, which the kernel gives only to the same user or to root.
-#     Their rows carry cpu 0.0 and rss 0.
+#     Their rows carry cpu 0.0 and rss 0, and their pids are the table's `blind`
+#     set. kiln-feed fills those two numbers from a slow ps (ps_usage(), every
+#     30 s) only while a subscriber draws top_cpu/top_mem; see Sys.rows() there.
 # cpu% is CPU time over the wall time since the previous table (a process seen
 # for the first time: over its life so far). ps prints the scheduler's decaying
 # average of the same thing; both read ~100 for a process spinning one core.
@@ -960,7 +1007,7 @@ def _table_libproc():
         _LP["at"] = mono
         _LP_PREV.clear()
         _LP_NAME.clear()
-        rows = []
+        rows, blind = Table(), set()
         for pid in pids[:n]:
             if pid <= 0:
                 continue
@@ -971,6 +1018,7 @@ def _table_libproc():
                     _LP_NAME[pid] = c
                     rows.append((pid, c[3], max(0, int(now - (c[0][0] + c[0][1] / 1e6))),
                                  0.0, 0, c[2]))
+                    blind.add(pid)
                     continue
             if lp.proc_pidinfo(pid, _PIDTASKALLINFO, 0, ra, size_a) == size_a:
                 b, t = a.bsd, a.task
@@ -999,10 +1047,12 @@ def _table_libproc():
                 comm = c[2] if c and c[0] == start and c[1] == short else (
                     _pidpath(pid) or short.decode("utf-8", "replace"))
                 _LP_NAME[pid] = (start, short, comm, ppid)
+                blind.add(pid)
             else:
                 continue                                   # gone
             rows.append((pid, ppid, max(0, int(now - (start[0] + start[1] / 1e6))),
                          round(pct, 1), rss, comm))
+        rows.blind = frozenset(blind)
         return rows
 
 

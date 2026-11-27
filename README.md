@@ -64,7 +64,7 @@ flowchart LR
 
 - **`feed/kiln-feed.py`** is a stdlib-only Python process. It prints one JSON snapshot per period: 100 ms to 1 s, live-adjustable.
   - It tails Claude Code's transcripts by byte offset, so it never re-reads a file.
-  - It reads machine statistics in process (sysctl, Mach, IOKit). It forks only `netstat`, on its own slower phase (and `ps`, only where libproc is unusable).
+  - It reads machine statistics in process (sysctl, Mach, IOKit). It forks `netstat` on its own slower phase, and `ps` every 30 s only while something draws the top-process lists (other users' CPU and memory need root), or wherever libproc is unusable.
   - Measured on 2026-11-04 (M1 Pro, `--stream` at 1 Hz, six live sessions, 60 s): **0.67% of one core and 27 MB RSS**. The method is in the file's header, and every line reports the feed's own cost in its `feed` block.
   - Optionally it runs once for every app that reads it (`--serve`, a LaunchAgent), and pushes a Claude session's change the moment it happens instead of at the next period. See **[docs/shared-feed.md](docs/shared-feed.md)**.
 - **`KilnWall.app`** (`Sources/`, about 5,700 lines of Swift) puts one borderless window per display just under the desktop icons, and passes each feed line to the page as text.

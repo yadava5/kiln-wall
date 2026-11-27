@@ -26,8 +26,8 @@ period for a transcript to be read.
   phase, so the feed does one tick for both.
 - **Costly blocks only on request.** The claude block is computed whenever anyone is
   subscribed. Weather and GitHub are not polled, the 14-day analytics is not derived, and the
-  machine is not sampled (except `ps`, which tells live sessions) unless a subscriber wants
-  them. KilnWall's covered pause is now a subscription: within its 120 s grace it stays
+  machine is not sampled (except the process table, which tells live sessions) unless a
+  subscriber wants them. KilnWall's covered pause is now a subscription: within its 120 s grace it stays
   subscribed at 1000 ms, holding the lines, exactly as before; past the grace it unsubscribes,
   and those blocks stop.
 - **Pushed, not polled.** kqueue watches `~/.claude/sessions` and each live session's json, the
@@ -135,9 +135,27 @@ fallback. The live agent, island subscribed, 35 s warm-up, 60 s, alternated, two
 The own column moves with the machine's load more than with the change (the Mac was compiling
 throughout). Two scratch copies run side by side, so under the same load: 1.17% and 1.04% total
 with `ps`, 0.60% and 0.47% with libproc, own CPU within 0.1%. Memory side by side after 90 s:
-16.6 against 16.5 MB RSS, 13.3 MB physical footprint each. What it cannot read unprivileged:
-another user's CPU and memory (ps is setuid root), so `top_cpu` and `top_mem` rank the user's
-own processes only.
+16.6 against 16.5 MB RSS, 13.3 MB physical footprint each.
+
+**Other users' processes** (2026-11-27). Unprivileged, libproc cannot read another user's CPU
+or memory: about 280 of 650 processes here (root, `_windowserver`, `_coreaudiod`, ...), so
+WindowServer at 30% vanished from `top_cpu`. `ps` can (setuid root). So while a subscriber
+wants the sys block, one `ps` every 30 s, on a thread, fills in cpu% and rss for exactly those
+rows; the table, sessions and liveness stay libproc. A filled cpu% is the CPU-time delta
+between two `ps` reads (its `time` column), the same measure as libproc's own rows over a
+longer window, so it is a 30 s average and up to 30 s old when shown (ps's own decaying %cpu
+only for the first read). Without a subscriber that wants sys, it never forks. The live agent,
+35 s warm-up, 60 s, alternated, two rounds:
+
+| | own | forks | total |
+|---|---|---|---|
+| island only (`want claude`) | 1.57%, 1.74% | 0 (0.000 s) | 1.57%, 1.74% |
+| island + a subscriber wanting `sys` at 1000 ms | 2.54%, 2.15% | 1.11%, 1.18% | 3.66%, 3.33% |
+
+The forks with sys wanted are mostly `netstat`, which that block has always run each second;
+the fill adds two `ps` a minute, about 0.14% of a core at the 42 ms a `ps` costs inside the
+agent (estimated from that, not measured apart). In both rounds
+WindowServer (27 to 32%) and `_coreaudiod`'s coreaudiod were back in `top_cpu`.
 
 Also gone: each return to the desktop past the 120 s grace used to start a new child, about
 0.15 CPU-seconds and 0.6 s before its first line (measured three times). Now KilnWall subscribes,
@@ -166,4 +184,6 @@ nothing, costly blocks off without a subscriber that wants them, a reader that s
 holding up nobody, one server per socket, the socket removed on exit and replaced after a crash.
 It also holds the in-process process table to `ps`: the same pids, parents and ages, the same
 names and resident sizes for the user's own processes, and about 100% for a process spinning a
-core. CI runs it on macOS.
+core. And the fill of other users' rows: no `ps` fork without the sys block (counted at
+`subprocess.run`), one with it, pid 1's memory filled in, cpu% as the CPU-time delta between two
+fills, a reused pid or a stale fill left out. CI runs it on macOS.

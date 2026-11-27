@@ -44,7 +44,9 @@ process (0.03 ms), re-read when powerd posts a change (notify_check, every
 tick) and every 2 s regardless. The process table (libproc in process, ~2 ms;
 a ps fork only where libproc is unusable) every 5 s, and at once, at most once
 a second, when a sessions/*.json names a live pid it has not listed yet. The
-one fork, on its own slow phase: netstat 1 s. A listed session whose pid has
+forks, on their own slow phases: netstat 1 s, and, only while the sys block is
+wanted, a ps every 30 s that fills in other users' CPU and memory for
+top_cpu/top_mem (Sys.rows). A listed session whose pid has
 died is dropped on the next tick (kill(pid, 0)), not at the next table. chime.jsonl is
 stat'ed every tick. Transcripts are read by a worker thread that
 remembers each file's byte offset: live sessions' files every 2 s, a stat
@@ -82,7 +84,8 @@ that finds no socket runs its own --stream child as before.
   feed.subs (subscribers now). The claude block is computed whenever anyone is
   subscribed. Each other block is computed only while some subscriber wants it:
   weather and GitHub are not polled, analytics is not derived, and the machine
-  is not sampled (but for ps, which tells live sessions) unless asked for.
+  is not sampled (but for the process table, which tells live sessions) unless
+  asked for; the slow ps behind top_cpu/top_mem runs only while sys is wanted.
   Lines go out on each subscriber's period AND, between periods, the moment a
   session changes: kqueue watches ~/.claude/sessions and each session's json,
   the cache folder (ask-chime locks), chime.jsonl, each live main transcript
@@ -122,9 +125,12 @@ null means "not measured / not knowable", never zero.
                     read from the same IOKit source pmset prints
     top_cpu         [[name, cpu%] x5]   from the process table, refreshed every 5 s
     top_mem         [[name, rss_bytes] x5]
-                    The user's own processes: another user's (root's, the
-                    window server's) CPU and memory are readable only as root,
-                    so they are not ranked (kiln-sample.py, THE PROCESS TABLE).
+                    Every user's processes. Another user's (root's, the window
+                    server's) CPU and memory are readable only as root, so
+                    those come from a ps every 30 s (setuid root), run only
+                    while the sys block is wanted: their cpu% is a 30 s
+                    average, up to 30 s old (Sys.rows; kiln-sample.py, THE
+                    PROCESS TABLE).
   claude
     limits
       five_hour, seven_day:
@@ -1406,9 +1412,12 @@ class Sys:
     # slower phases whatever the stream period is. Battery (2026-11-05): no
     # longer pmset (6.3 ms child CPU, so it ran every 30 s and lagged 7-23 s);
     # IOKit in process, 0.03 ms, on powerd's change notification and every 2 s.
+    # "fill" (2026-11-27): the slow ps that fills in other users' CPU and memory for
+    # top_cpu/top_mem, only while a subscriber draws them (see rows()).
     PHASES = {"ps": 5.0, "net": 1.0, "batt": 2.0, "swap": 0.0, "disk": 0.0,
-              "gpu_fork": 3.0}
+              "gpu_fork": 3.0, "fill": 30.0}
     PS_MIN_S = 1.0       # an on-demand ps (a new session) at most this often
+    FILL_MAX_S = 75.0    # a fill older than this (the lists were off a while) is not used
 
     def __init__(self):
         self.last = {}
@@ -1431,6 +1440,9 @@ class Sys:
         self.batt = None
         self.procs = []
         self.ps_at = 0.0
+        self.fill = {}             # pid -> (start, cpu%, rss) from the slow ps, see rows()
+        self.fill_at = 0.0         # when the last one landed; 0 = never
+        self._fill_prev = None     # (ps_usage(), when) of the last one, for CPU-time deltas
         self.machine_at = 0.0      # last tick that sampled the machine (rates are differences)
 
     def _due(self, name, now, force):
@@ -1439,9 +1451,11 @@ class Sys:
             return True
         return False
 
-    def tick(self, force=False, machine=True):
+    def tick(self, force=False, machine=True, top=False):
         """machine=False (--serve with no subscriber that draws the machine): only
-        the ps phase, which the claude block needs to tell live sessions."""
+        the ps phase, which the claude block needs to tell live sessions. top: the
+        sys block (top_cpu/top_mem) is drawn, so the slow ps fill runs too; never
+        without it."""
         now = time.time()
         if not machine:
             if self._due("ps", now, force):
@@ -1508,6 +1522,10 @@ class Sys:
             self.batt = S.battery_fast()
         if self._due("ps", now, force):
             self._ps(now, force)
+        # Only where the table has rows it could not read (none with the ps fallback),
+        # and checked before the phase so a table still landing does not spend it.
+        if top and getattr(self.procs, "blind", None) and self._due("fill", now, force):
+            self._fill(force)
 
     # --serve sets this: the periodic table is read on a thread, so the loop that pushes
     # session changes never waits on it. That was for the ps fork (measured 2026-11-27: 49 ms
@@ -1542,10 +1560,75 @@ class Sys:
         self.ps_at = self.last["ps"] = now
         return True
 
+    # ── other users' CPU and memory (2026-11-27) ──
+    # libproc cannot read another user's CPU or memory unprivileged (root, the window
+    # server: ~280 of ~650 processes here), and ps can (setuid root) at 42 ms of child
+    # CPU a fork. So the table stays libproc, sessions and liveness read only that, and
+    # while a subscriber draws top_cpu/top_mem one ps every 30 s, on a thread in --serve
+    # like the table, fills in cpu% and rss for the table's `blind` rows and nothing
+    # else. No subscriber drawing them, no fork.
+    #
+    # cpu%, the two sources kept to one meaning, CPU time over wall time in % of a core:
+    # the user's own rows are libproc's delta over the last table (~5 s); a filled row
+    # is the delta of ps's cumulative `time` between this fill and the previous one
+    # (~30 s). ps's own %cpu, the scheduler's decaying average, is used only for a fill
+    # with no previous one within 2 phases (the first after the lists come back), where
+    # there is no delta yet. So a filled row is a 30 s average, and a filled value is up
+    # to 30 s old (plus the 5 s table) when it is shown; for ranking what is busy, that
+    # is fine. A fill is matched to its row by pid and start time (to 3 s), so a reused
+    # pid never takes another process's numbers.
+
+    def _fill(self, force):
+        if not self.ps_async or force:
+            self._fill_from(S.ps_usage(), time.time())
+            return
+        if getattr(self, "_fill_busy", False):
+            return
+        self._fill_busy = True
+
+        def run():
+            try:
+                self._fill_from(S.ps_usage(), time.time())
+            finally:
+                self._fill_busy = False
+        threading.Thread(target=run, daemon=True).start()
+
+    def _fill_from(self, cur, now):
+        if not cur:
+            return
+        prev, at = self._fill_prev or ({}, 0.0)
+        dt = now - at
+        delta = 0.5 < dt <= 2 * self.PHASES["fill"]
+        fill = {}
+        for pid, (start, cpu_s, pct, rss) in cur.items():
+            p = prev.get(pid) if delta else None
+            if p and abs(p[0] - start) <= 3.0:
+                pct = max(0.0, 100.0 * (cpu_s - p[1]) / dt)
+            fill[pid] = (start, round(pct, 1), rss)
+        self._fill_prev = (cur, now)
+        self.fill, self.fill_at = fill, now
+
+    def rows(self):
+        """The table top_cpu/top_mem rank: libproc's rows, with cpu% and rss of the rows
+        it could not read taken from the last fill (see above)."""
+        procs, fill = self.procs, self.fill
+        blind = getattr(procs, "blind", None)
+        if not blind or not fill or time.time() - self.fill_at > self.FILL_MAX_S:
+            return procs
+        at = self.ps_at
+        out = []
+        for p in procs:
+            if p[0] in blind:
+                f = fill.get(p[0])
+                if f and abs((at - p[2]) - f[0]) <= 3.0:
+                    p = (p[0], p[1], p[2], f[1], f[2], p[5])
+            out.append(p)
+        return out
+
     def block(self):
         used, total, wired, active, comp, cached = self.mem or (0, 0, 0, 0, 0, 0)
         g = self.gpu
-        procs = self.procs
+        procs = self.rows()
         name = lambda c: os.path.basename(c) or c
         return {
             "cpu": round(self.cpu, 1), "user": round(self.user, 1), "sys": round(self.sys, 1),
@@ -2375,7 +2458,7 @@ class Feed:
         now = time.time()
         want = BLOCKS if want is None else want
         machine = "sys" in want or "hist" in want
-        self.sys.tick(force, machine=machine)
+        self.sys.tick(force, machine=machine, top="sys" in want)
         if claude is None:
             claude = self.claude(now, force)
         if "analytics" in want and (force or self._every("analytics", 10.0, now)
@@ -2905,6 +2988,7 @@ class Serve:
                 "pushes": self.pushes,
                 # When the costly parts last ran: they run only while someone wants them.
                 "machine_at": round(self.f.sys.machine_at, 1) or None,
+                "fill_at": round(self.f.sys.fill_at, 1) or None,   # the slow ps (Sys.rows)
                 "analytics_at": round(self.f.last["analytics"], 1) if "analytics" in self.f.last else None,
                 "watching": {"files": len(self.watch), "pids": len(self.pids)},
                 "subs": [{"name": s.name, "want": sorted(s.want),
